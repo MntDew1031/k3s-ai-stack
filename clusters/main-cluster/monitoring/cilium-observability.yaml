@@ -1,0 +1,92 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cilium-agent
+  namespace: kube-system
+  labels:
+    app: cilium
+    k8s-app: cilium
+spec:
+  clusterIP: None
+  ports:
+    - name: prometheus
+      port: 9962
+      targetPort: 9962
+      protocol: TCP
+    - name: hubble-metrics
+      port: 9965
+      targetPort: 9965
+      protocol: TCP
+  selector:
+    k8s-app: cilium
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cilium-agent-monitor
+  namespace: monitoring
+  labels:
+    release: monitoring
+    app: cilium
+spec:
+  namespaceSelector:
+    matchNames:
+      - kube-system
+  selector:
+    matchLabels:
+      k8s-app: cilium
+  endpoints:
+    - port: prometheus
+      path: /metrics
+      interval: 10s
+    - port: hubble-metrics
+      path: /metrics
+      interval: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cilium-operator-monitor
+  namespace: monitoring
+  labels:
+    release: monitoring
+    app: cilium
+spec:
+  namespaceSelector:
+    matchNames:
+      - kube-system
+  selector:
+    matchLabels:
+      io.cilium/app: operator
+  endpoints:
+    - port: prometheus
+      path: /metrics
+      interval: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: cilium-agent-monitor
+  namespace: monitoring
+  labels:
+    release: monitoring
+    app: cilium
+spec:
+  selector:
+    matchLabels:
+      k8s-app: cilium
+  namespaceSelector:
+    matchNames:
+      - kube-system
+  podTargetLabels:
+    - k8s-app
+    - app.kubernetes.io/name
+  podMetricsEndpoints:
+    - port: prometheus
+      path: /metrics
+      interval: 15s
+    - port: hubble-metrics
+      path: /metrics
+      interval: 15s
+---

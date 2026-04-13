@@ -1,0 +1,67 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-telemetry-sa
+  namespace: ai-stack
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-telemetry-role
+rules:
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-telemetry-binding
+subjects:
+- kind: ServiceAccount
+  name: mcp-telemetry-sa
+  namespace: ai-stack
+roleRef:
+  kind: ClusterRole
+  name: mcp-telemetry-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-telemetry
+  namespace: ai-stack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-telemetry
+  template:
+    metadata:
+      labels:
+        app: mcp-telemetry
+    spec:
+      serviceAccountName: mcp-telemetry-sa
+      containers:
+      - name: server
+        image: mntdew1031/k8s-telemetry-mcp:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-telemetry-svc
+  namespace: ai-stack
+spec:
+  selector:
+    app: mcp-telemetry
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000

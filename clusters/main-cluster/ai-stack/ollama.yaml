@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ai-stack
+  labels:
+    app: ollama
+spec:
+  ports:
+  - port: 11434
+    targetPort: 11434
+    name: http
+  selector:
+    app: ollama
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ollama
+  namespace: ai-stack
+spec:
+  serviceName: "ollama"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+                - think-frankenstein
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        imagePullPolicy: Always
+        env:
+        - name: OLLAMA_NUM_PARALLEL
+          value: "1"
+        - name: OLLAMA_MAX_LOADED_MODELS
+          value: "3"
+        - name: OLLAMA_HOST
+          value: "0.0.0.0:11434"
+        - name: OLLAMA_ORIGINS
+          value: "*"
+        ports:
+        - containerPort: 11434
+        resources:
+          limits:
+            gpu.intel.com/i915: 1
+            memory: "12Gi"
+        volumeMounts:
+        - mountPath: /root/.ollama
+          name: models
+  volumeClaimTemplates:
+  - metadata:
+      name: models
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "longhorn"
+      resources:
+        requests:
+          storage: 30Gi

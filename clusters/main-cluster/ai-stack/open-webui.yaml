@@ -1,0 +1,69 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: open-webui
+  namespace: ai-stack
+spec:
+  interval: 1h
+  url: https://helm.openwebui.com/
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: open-webui
+  namespace: ai-stack
+spec:
+  interval: 1h
+  timeout: 15m
+  chart:
+    spec:
+      chart: open-webui
+      version: "3.x.x"
+      sourceRef:
+        kind: HelmRepository
+        name: open-webui
+  values:
+    image:
+      tag: "v0.8.12"
+    persistence:
+      enabled: true
+      size: 2Gi
+      storageClass: "longhorn"
+
+    ollama:
+      enabled: false
+    pipelines:
+      enabled: false
+
+    ollamaUrls:
+      - "http://ollama.ai-stack.svc.cluster.local:11434"
+
+    extraEnvVars:
+      - name: OLLAMA_METRICS
+        value: "1"
+
+    service:
+      type: NodePort
+      nodePort: 30080
+
+    serviceAccount:
+      create: true
+    
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 50
+          preference:
+            matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+              - think3
+        - weight: 10
+          preference:
+            matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+              - think1

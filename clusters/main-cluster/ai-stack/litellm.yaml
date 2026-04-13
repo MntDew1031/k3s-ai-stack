@@ -1,0 +1,138 @@
+---
+# 1. PostgreSQL Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: litellm-db-pvc
+  namespace: ai-stack
+spec:
+  accessModes: [ "ReadWriteOnce" ]
+  storageClassName: "longhorn"
+  resources:
+    requests:
+      storage: 1Gi
+---
+# 2. PostgreSQL Database
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm-db
+  namespace: ai-stack
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: litellm-db
+  template:
+    metadata:
+      labels:
+        app: litellm-db
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_USER
+          value: "superrealuser"
+        - name: POSTGRES_PASSWORD
+          value: "superrealpassword"
+        - name: POSTGRES_DB
+          value: "litellm"
+        - name: PGDATA
+          value: "/var/lib/postgresql/data/pgdata"
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: db-data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: db-data
+        persistentVolumeClaim:
+          claimName: litellm-db-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm-db
+  namespace: ai-stack
+spec:
+  ports:
+  - port: 5432
+  selector:
+    app: litellm-db
+---
+# 3. LiteLLM Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: ai-stack
+data:
+  config.yaml: |
+    model_list:
+      - model_name: llama3.2:latest
+        litellm_params:
+          model: ollama/llama3.2:latest
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: qwen2.5:7b
+        litellm_params:
+          model: ollama/qwen2.5:7b
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: qwen3.5:9b
+        litellm_params:
+          model: ollama/qwen3.5:9b
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+---
+# 4. LiteLLM Gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: ai-stack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      containers:
+      - name: litellm
+        image: ghcr.io/berriai/litellm:main-latest
+        args:
+        - "--config"
+        - "/app/config.yaml"
+        env:
+        - name: DATABASE_URL
+          value: "postgresql://superrealuser:superrealpassword@litellm-db.ai-stack.svc.cluster.local:5432/litellm"
+        - name: LITELLM_MASTER_KEY
+          value: "sk-supersecretkey"
+        ports:
+        - containerPort: 4000
+        volumeMounts:
+        - name: config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+      volumes:
+      - name: config
+        configMap:
+          name: litellm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: ai-stack
+spec:
+  type: NodePort
+  ports:
+  - port: 4000
+    targetPort: 4000
+    nodePort: 31031
+  selector:
+    app: litellm

@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ollama.yaml
+  - open-webui.yaml
+  - ollama-service-monitor.yaml
+  - custom-mcp.yaml
+  - mcp-manifest.yaml
+  - litellm.yaml

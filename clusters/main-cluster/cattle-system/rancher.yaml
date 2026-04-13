@@ -1,0 +1,49 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: rancher-stable
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://releases.rancher.com/server-charts/latest
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: rancher
+  namespace: cattle-system
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: rancher
+      version: "2.14.0"
+      sourceRef:
+        kind: HelmRepository
+        name: rancher-stable
+        namespace: flux-system
+  values:
+    hostname: rancher.local
+    replicas: 1 
+    
+    webhook:
+      nodeSelector:
+        kubernetes.io/hostname: think1
+        
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              kind: Deployment
+              name: rancher
+            patch: |-
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: rancher
+              spec:
+                template:
+                  spec:
+                    nodeSelector:
+                      kubernetes.io/hostname: think1
