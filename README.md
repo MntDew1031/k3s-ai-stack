@@ -17,6 +17,7 @@ This repository contains the infrastructure as code for a highly available bare 
 This is a homelab environment built to demonstrate complex systems engineering concepts rather than raw compute power. The nodes are all low wattage machines.
 
 **ThinkCentre micro computers. Each is powered by a low voltage CPU:**
+![Mini-Rack](./images/mini-rack.JPG)
 * **think1:** Intel Core i3-6100T | 16GB of RAM | Control Plane | 2nd node in the picture
 * **think2:** Intel Pentium CPU N3700 | 8/16GB of RAM (One DIMM died i think ): ) | 3rd node in the picture
 * **think3:** Intel Core i3-4130T | 8 GB of RAM | 4th node in the picture
