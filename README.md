@@ -4,7 +4,7 @@
 
 This repository contains the infrastructure as code for a highly available bare metal Kubernetes cluster dedicated to local AI workloads. The environment is provisioned using K3s and managed through Rancher across a 4-node topology. This cluster is built entirely for demonstration and portfolio purposes. It runs smaller local models just efficiently enough to prove the enterprise architecture works without igniting the CPUs to burn down my apartment.
 
-**Note:** This is a (hopefully) sanitized public mirror of a self-hosted Gitea repository as of 04/12/2026.
+**Note:** This is a sanitized public mirror of a self-hosted Gitea repository as of 04/12/2026. Major Security updates have been pushed since.
 
 * [Show me the specs](#hardware-topology)
 * [What I am running](#core-infrastructure)
@@ -21,9 +21,9 @@ This is a homelab environment built to demonstrate complex systems engineering c
 ![Mini-Rack](./images/mini-rack-2.png)
 
 * **think1:** Intel Core i3-6100T | 16GB of RAM | Control Plane | 2nd node in the picture
-* **think2:** Intel Pentium CPU N3700 | 8/16GB of RAM (One DIMM died i think ): ) | 3rd node in the picture
+* **think2:** Intel Pentium CPU N3700 | 8GB of RAM | 3rd node in the picture
 * **think3:** Intel Core i3-4130T | 8 GB of RAM | 4th node in the picture
-* **think-frankenstein:** 13th Gen Intel Core i3-1315U | 16GB of RAM | 5th "node" (yea its a barebones laptop in a rack with questionable cpu cooling) | ironically running the AI models btw
+* **think-frankenstein:** 13th Gen Intel Core i3 1315U | 16GB of RAM | Barebones laptop motherboard mounted in rack serving as the primary AI inference node.
 
 ## Core Infrastructure
 
@@ -91,5 +91,5 @@ If you received my resume then you already have the URL and the creds to login t
    * We will prompt this model to pull either CPU or Memory stats from any of the 4 nodes. Use my example prompt first for the best results:
      * Example: Check the current CPU usage for the think1 node using the telemetry tool.
      * Example: Check the current (CPU or Memory) usage for the (insert name of node) node using the telemetry tool.
-   * This one will most likely take a bit longer as this is running on decade old hardware and most likely thermal throttling :)
+   * This one will most likely take a bit longer as this is running on decade old hardware and most likely thermal throttling.
    * BUT eventually it will produce a percentage amount for the usage of either the CPU or Memory!
