@@ -217,22 +217,3 @@ clusters/home-cluster/
 └── tools/             Developer-side utilities maintained with the platform
 ```
 
-## Validation performed before publication
-
-- Every Kustomization renders successfully with `kubectl kustomize`
-- Every YAML and JSON file parses successfully
-- Forty Python unit tests pass
-- No Kubernetes Secret documents are present
-- Known credential formats, encrypted SOPS values, private identifiers, real
-  LAN values, personal paths, and first-party registry locations are absent
-- Image metadata is removed from the physical rack photo
-- The public repository starts from one sanitized root commit and shares no
-  commit ancestry with the private source repository
-
----
-
-<div align="center">
-
-**Designed, operated, and documented as a real platform—not a one-click demo.**
-
-</div>
