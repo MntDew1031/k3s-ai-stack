@@ -1,0 +1,21 @@
+# Public portfolio representation of the Suppr workload.
+# Secret objects and private registry configuration are deliberately omitted.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - postgres.yaml
+  - redis.yaml
+  - uploads-pvc.yaml
+  - api.yaml
+  - admin-lan.yaml
+  - web.yaml
+  - cloudflared.yaml
+  - network-policies.yaml
+  - pg-backup.yaml
+  - nudge.yaml
+  - cook-reminder.yaml
+  - schedule-votes.yaml
+  - weekly-digest.yaml
+  - image-gc.yaml

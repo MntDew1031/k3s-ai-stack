@@ -1,0 +1,100 @@
+# Permanent encrypted LAN-only entrypoint for the Suppr admin dashboard.
+# K3s ServiceLB binds 4646 on every node and forwards to Traefik websecure;
+# only /admin is routed to Suppr. Trust the generated Suppr CA once on each
+# operator device (instructions live in the app repo's LAUNCH_GUIDE.md).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: suppr-admin-lan
+  namespace: kube-system
+spec:
+  type: LoadBalancer
+  # Register the existing HA kube-vip address with Cilium's service map so
+  # port 4646 follows the active control-plane node instead of one node IP.
+  externalIPs:
+    - 192.0.2.10
+  loadBalancerSourceRanges:
+    - 192.0.2.0/24
+  selector:
+    app.kubernetes.io/instance: traefik-kube-system
+    app.kubernetes.io/name: traefik
+  ports:
+    - name: admin-https
+      port: 4646
+      targetPort: websecure
+      protocol: TCP
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: suppr-admin-selfsigned
+  namespace: suppr
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: suppr-admin-ca
+  namespace: suppr
+spec:
+  isCA: true
+  commonName: Suppr Admin LAN CA
+  secretName: suppr-admin-ca
+  duration: 87600h
+  renewBefore: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  issuerRef:
+    name: suppr-admin-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: suppr-admin-ca
+  namespace: suppr
+spec:
+  ca:
+    secretName: suppr-admin-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: suppr-admin-tls
+  namespace: suppr
+spec:
+  secretName: suppr-admin-tls
+  duration: 8760h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  ipAddresses:
+    - 192.0.2.10
+  issuerRef:
+    name: suppr-admin-ca
+    kind: Issuer
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: suppr-admin-lan
+  namespace: suppr
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: PathPrefix(`/admin`)
+      services:
+        - name: api
+          namespace: suppr
+          port: 8000
+          scheme: http
+  tls:
+    secretName: suppr-admin-tls

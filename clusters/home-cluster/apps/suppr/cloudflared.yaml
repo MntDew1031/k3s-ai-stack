@@ -1,0 +1,102 @@
+---
+# Cloudflare Tunnel (token model) dedicated to Suppr. Same pattern as the
+# ai-stack tunnel.
+#
+# The tunnel token is NOT in Git. Create a NEW tunnel in the Cloudflare Zero
+# Trust dashboard, then:
+# Supply the tunnel token through the private secret-management workflow.
+#
+# Public hostname routing is configured in the dashboard, not here
+# (Zero Trust -> Networks -> Tunnels -> <suppr tunnel> -> Public Hostname).
+# Add the app.example.com zone to this Cloudflare account first, then:
+#   app.example.com      -> http://web.suppr.svc.cluster.local:3000
+#   www.app.example.com  -> http://web.suppr.svc.cluster.local:3000
+#   api.app.example.com  -> http://api.suppr.svc.cluster.local:8000
+#
+# TLS terminates at Cloudflare's edge; the tunnel reaches the Services over
+# plain in-cluster HTTP, so no cert-manager/ingress is needed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: suppr
+  labels:
+    app.kubernetes.io/name: cloudflare-tunnel
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflare-tunnel
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudflare-tunnel
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudflare-tunnel
+      containers:
+        - name: cloudflared
+          image: example.invalid/third-party/tunnel-agent:PINNED_VERSION
+          imagePullPolicy: IfNotPresent
+          args: [tunnel, --no-autoupdate, --metrics, 0.0.0.0:2000, --protocol, http2, run]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cloudflared-token
+                  key: token
+            - name: TUNNEL_TRANSPORT_PROTOCOL
+              value: "http2"
+          ports:
+            - name: metrics
+              containerPort: 2000
+              protocol: TCP
+          livenessProbe:
+            httpGet: { path: /ready, port: 2000 }
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet: { path: /ready, port: 2000 }
+            failureThreshold: 2
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+---
+# Keep at least one tunnel replica up during a node drain or upgrade.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudflared
+  namespace: suppr
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflare-tunnel

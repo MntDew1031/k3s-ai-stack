@@ -1,0 +1,52 @@
+# Weekly digest (#30). Runs the api image's `app.jobs.weekly_digest` module
+# HOURLY: for each household it fires once a week when it's Sunday >= 6pm in the
+# household's LOCAL timezone (so every timezone gets it at a sane hour), guarded
+# by households.last_weekly_digest_on for once-a-week idempotency. Households
+# with no decided dinners that week are skipped (no empty digests). Fast no-op
+# most hours.
+#
+# Inert until the APNs secrets exist (same as nudge) — logs and exits 0.
+# NB: bump this image tag together with api.yaml on each release.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: weekly-digest
+  namespace: suppr
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: weekly-digest   # netpol: egress to postgres + APNs (443)
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: regcred
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: weekly-digest
+              image: example.invalid/private/backend:REDACTED
+              command: ["python", "-m", "app.jobs.weekly_digest"]
+              envFrom:
+                - configMapRef: { name: suppr-config }
+                - secretRef: { name: suppr-secrets }
+              resources:
+                requests: { cpu: "50m", memory: "128Mi" }
+                limits: { cpu: "500m", memory: "512Mi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]

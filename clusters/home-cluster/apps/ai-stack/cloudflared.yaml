@@ -1,0 +1,135 @@
+---
+# Cloudflare Tunnel (token model).
+#
+# The tunnel token itself is NOT in Git. Create it manually:
+# Supply the tunnel token through the private secret-management workflow.
+#
+# Public hostname routing is configured in the Cloudflare dashboard, not here:
+#   Zero Trust -> Networks -> Tunnels -> <your tunnel> -> Public Hostname
+#
+# Current routes (keep this list in sync with the dashboard):
+#   ai.example.com        -> http://open-webui.ai-stack.svc.cluster.local:80
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: ai-stack
+  labels:
+    app.kubernetes.io/name: cloudflare-tunnel
+spec:
+  # Two replicas so an upgrade or node drain does not knock you offline.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflare-tunnel
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudflare-tunnel
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread replicas across nodes so losing one node does not kill the tunnel.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudflare-tunnel
+      containers:
+        - name: cloudflared
+          # Pin to a specific version. Bump intentionally after testing.
+          image: cloudflare/cloudflared:2025.4.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --metrics
+            - 0.0.0.0:2000
+            - --protocol
+            - http2
+            - run
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cloudflared-token
+                  key: token
+            # Belt + suspenders: also set via env in case args get overridden.
+            - name: TUNNEL_TRANSPORT_PROTOCOL
+              value: "http2"
+          ports:
+            - name: metrics
+              containerPort: 2000
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: 2000
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 2000
+            failureThreshold: 2
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+# Optional: scrape cloudflared metrics with Prometheus if you have the operator.
+# Comment this out if you are not running prometheus-operator / ServiceMonitor CRDs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudflared-metrics
+  namespace: ai-stack
+  labels:
+    app.kubernetes.io/name: cloudflare-tunnel
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: cloudflare-tunnel
+  ports:
+    - name: metrics
+      port: 2000
+      targetPort: metrics
+---
+# Keep at least one tunnel replica up during a node drain or upgrade so the
+# public hostnames never go fully dark.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudflared
+  namespace: ai-stack
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflare-tunnel

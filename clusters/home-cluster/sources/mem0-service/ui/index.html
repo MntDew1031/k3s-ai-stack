@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#0b0f14">
+    <title>Mem0 Console</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div>
+            <p class="eyebrow">AI stack</p>
+            <h1>Mem0 Console</h1>
+          </div>
+        </div>
+
+        <section class="side-section">
+          <div class="section-heading">
+            <span>Saved scopes</span>
+            <span class="section-actions">
+              <button class="icon-button" id="refresh-scopes-button" type="button" aria-label="Refresh scopes from Mem0" title="Refresh scopes from Mem0" disabled>↻</button>
+              <button class="icon-button" id="add-scope-button" type="button" aria-label="Add scope" title="Add scope">+</button>
+            </span>
+          </div>
+          <nav id="scope-list" class="scope-list" aria-label="Memory scopes"></nav>
+          <p id="no-scopes" class="side-hint">Add a scope such as <code>opencode</code> or <code>owui:you@example.com</code>.</p>
+        </section>
+
+        <div class="sidebar-footer">
+          <button class="connection-card" id="connection-button" type="button">
+            <span class="status-dot" id="status-dot"></span>
+            <span>
+              <strong id="connection-label">API key required</strong>
+              <small>NodePort 31060</small>
+            </span>
+            <span class="chevron">›</span>
+          </button>
+          <p>Credentials stay in this browser tab.</p>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="scope-kind-label">No scope selected</p>
+            <h2 id="scope-title">Choose a memory scope</h2>
+          </div>
+          <div class="top-actions">
+            <button class="button ghost" id="export-button" type="button" disabled>Export JSON</button>
+            <button class="button primary" id="new-memory-button" type="button" disabled><span>+</span> New memory</button>
+          </div>
+        </header>
+
+        <section class="toolbar" aria-label="Memory tools">
+          <form class="search-box" id="search-form">
+            <span aria-hidden="true">⌕</span>
+            <input id="search-input" type="search" placeholder="Semantic search in this scope" autocomplete="off" disabled>
+            <button type="submit" id="search-button" disabled>Search</button>
+          </form>
+          <button class="button subtle" id="show-all-button" type="button" disabled>Show all</button>
+          <button class="button subtle" id="refresh-button" type="button" disabled>↻ Refresh memories</button>
+        </section>
+
+        <section class="stats" aria-label="Scope summary">
+          <article class="stat-card">
+            <span class="stat-icon green">◆</span>
+            <div><strong id="memory-count">0</strong><small>memories loaded</small></div>
+          </article>
+          <article class="stat-card">
+            <span class="stat-icon violet">◈</span>
+            <div><strong id="scope-stat">None</strong><small>active scope</small></div>
+          </article>
+          <article class="stat-card">
+            <span class="stat-icon amber">●</span>
+            <div><strong id="mode-stat">Browse</strong><small>current view</small></div>
+          </article>
+        </section>
+
+        <section class="content-panel">
+          <div class="content-heading">
+            <div>
+              <h3 id="results-heading">Memories</h3>
+              <p id="results-subtitle">Select a scope to load its memories.</p>
+            </div>
+            <div class="content-controls">
+              <label class="client-filter">
+                <span>Sort</span>
+                <select id="sort-order" disabled>
+                  <option value="newest">Newest first</option>
+                  <option value="oldest">Oldest first</option>
+                </select>
+              </label>
+              <label class="client-filter">
+                <span>Filter loaded</span>
+                <input id="filter-input" type="search" placeholder="Type to filter" disabled>
+              </label>
+            </div>
+          </div>
+
+          <div id="selection-bar" class="selection-bar" hidden>
+            <label class="selection-toggle">
+              <input id="select-visible" type="checkbox">
+              <span>Select all shown</span>
+            </label>
+            <strong id="selected-count">0 selected</strong>
+            <div class="selection-actions">
+              <button id="remove-duplicates" class="selection-button" type="button">Remove exact duplicates</button>
+              <button id="clear-selection" class="selection-button" type="button">Clear</button>
+              <button id="delete-selected" class="selection-button delete" type="button" disabled>Delete selected</button>
+            </div>
+          </div>
+
+          <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+          <div id="loading" class="loading-grid" hidden>
+            <div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>
+          </div>
+          <div id="memory-grid" class="memory-grid"></div>
+
+          <div id="empty-state" class="empty-state">
+            <div class="empty-orbit"><span></span></div>
+            <h3>Your memory workspace is ready</h3>
+            <p>Connect with the Mem0 API key, then add or select a scope.</p>
+          </div>
+        </section>
+
+        <section class="danger-zone" id="danger-zone" hidden>
+          <div>
+            <h3>Scope danger zone</h3>
+            <p>Delete every memory currently stored in <strong id="danger-scope"></strong>. Other scopes are not touched.</p>
+          </div>
+          <button class="button danger-outline" id="delete-scope-button" type="button">Delete scope memories</button>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="connection-dialog">
+      <form class="modal" id="connection-form" method="dialog">
+        <button class="modal-close" id="connection-close" type="button" aria-label="Close">×</button>
+        <p class="eyebrow">Secure connection</p>
+        <h2>Connect to Mem0</h2>
+        <p class="modal-copy">Enter the value from <code>MEM0_API_KEY</code>. It is held in session storage and cleared when this tab closes.</p>
+        <label class="field">
+          <span>API key</span>
+          <div class="secret-input">
+            <input id="api-key-input" type="password" required autocomplete="off" placeholder="Paste API key">
+            <button id="toggle-key-button" type="button">Show</button>
+          </div>
+        </label>
+        <div class="modal-actions">
+          <button class="button ghost" id="connection-cancel" type="button">Cancel</button>
+          <button class="button primary" id="connect-submit" value="default">Test and connect</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="scope-dialog">
+      <form class="modal" id="scope-form" method="dialog">
+        <button class="modal-close" id="scope-close" type="button" aria-label="Close">×</button>
+        <p class="eyebrow">Memory namespace</p>
+        <h2>Add a scope</h2>
+        <p class="modal-copy">Scopes keep consumers separate. OpenWebUI normally uses <code>owui:&lt;email&gt;</code>; LiteLLM keys use their configured memory scope.</p>
+        <label class="field">
+          <span>Scope type</span>
+          <select id="scope-type-input">
+            <option value="user_id">User ID</option>
+            <option value="agent_id">Agent ID</option>
+            <option value="run_id">Run ID</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Scope value</span>
+          <input id="scope-value-input" required maxlength="250" placeholder="e.g. opencode">
+        </label>
+        <div class="modal-actions">
+          <button class="button ghost" id="scope-cancel" type="button">Cancel</button>
+          <button class="button primary" id="scope-submit" value="default">Save scope</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="memory-dialog">
+      <form class="modal wide" id="memory-form" method="dialog">
+        <button class="modal-close" id="memory-close" type="button" aria-label="Close">×</button>
+        <p class="eyebrow" id="memory-modal-eyebrow">Manual memory</p>
+        <h2 id="memory-modal-title">Add memory</h2>
+        <p class="modal-copy" id="memory-modal-copy">Store an exact, durable fact in the active scope.</p>
+        <input id="memory-id-input" type="hidden">
+        <label class="field">
+          <span>Memory text</span>
+          <textarea id="memory-text-input" required maxlength="50000" rows="8" placeholder="Write a durable fact or project detail..."></textarea>
+          <small><span id="character-count">0</span> / 50,000</small>
+        </label>
+        <label class="toggle-row" id="infer-row">
+          <span><strong>AI extraction</strong><small>Let Mem0 extract facts and reconcile related memories. Leave off to save this text exactly.</small></span>
+          <input id="infer-input" type="checkbox">
+          <i></i>
+        </label>
+        <div class="modal-actions">
+          <button class="button ghost" id="memory-cancel" type="button">Cancel</button>
+          <button class="button primary" id="memory-submit" value="default">Save memory</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="confirm-dialog">
+      <form class="modal compact" id="confirm-form" method="dialog">
+        <div class="warning-icon">!</div>
+        <h2 id="confirm-title">Delete memory?</h2>
+        <p class="modal-copy" id="confirm-copy">This action cannot be undone.</p>
+        <label class="field" id="confirm-field" hidden>
+          <span id="confirm-label">Type the scope to confirm</span>
+          <input id="confirm-input" autocomplete="off">
+        </label>
+        <div class="modal-actions split">
+          <button class="button ghost" id="confirm-cancel" type="button">Keep it</button>
+          <button class="button danger" id="confirm-submit" value="default">Delete</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="history-dialog">
+      <div class="modal wide">
+        <button class="modal-close" id="history-close" aria-label="Close">×</button>
+        <p class="eyebrow">Local audit trail</p>
+        <h2>Memory history</h2>
+        <p class="modal-copy">History is pod-local and resets when the Mem0 pod restarts. The memory itself remains in pgvector.</p>
+        <div id="history-list" class="history-list"></div>
+      </div>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  </body>
+</html>

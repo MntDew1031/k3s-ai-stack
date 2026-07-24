@@ -1,0 +1,537 @@
+# Zero-trust network policy for ai-stack.
+# Default deny both directions, then allow the real call graph:
+#   cloudflared -> open-webui:80
+#   open-webui  -> litellm:4000, ollama:11434, DNS
+#   litellm     -> ollama:11434, litellm-db:5432, DNS, api.anthropic.com:443,
+#                  generativelanguage.googleapis.com:443
+#   ollama      -> DNS (for pulls), HTTPS egress for model downloads
+#   litellm-db  -> DNS
+# NB: if you ever add a Prometheus scrape target in this namespace, that
+# target's policy must allow ingress from {namespace=monitoring,
+# app.kubernetes.io/name=prometheus} or the scrape silently fails.
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny
+  namespace: ai-stack
+spec:
+  endpointSelector: {}
+  ingress:
+    - {}
+  egress:
+    - {}
+  ingressDeny:
+    - {}
+  egressDeny:
+    - {}
+---
+# Every pod in ai-stack needs DNS against kube-dns.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: ai-stack
+spec:
+  endpointSelector: {}
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": kube-system
+            "k8s:k8s-app": kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          # NOTE: L7 DNS rules (rules.dns) intentionally removed. They forced
+          # all DNS through Cilium's in-agent DNS proxy, which fails to
+          # re-establish its eBPF redirect after a node power-cycle / agent
+          # restart and silently drops all pod DNS (CoreDNS healthy, nodes
+          # healthy, but nothing resolves). No toFQDNs policies exist, so the
+          # L7 proxy provided zero filtering value. Plain L3/L4 allow to
+          # kube-dns:53 is robust across reboots.
+---
+# OpenWebUI: ingress from cloudflared only; egress to its AI services.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: open-webui
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/instance: open-webui
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            # cloudflared deployment label.
+            app.kubernetes.io/name: cloudflare-tunnel
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: litellm
+      toPorts:
+        - ports:
+            - port: "4000"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: ollama
+      toPorts:
+        - ports:
+            - port: "11434"
+              protocol: TCP
+    # OpenWebUI loads tools from the custom MCP telemetry server over OpenAPI.
+    - toEndpoints:
+        - matchLabels:
+            app: mcp-telemetry
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+    # OpenWebUI memory filter needs to talk to the mem0 API.
+    - toEndpoints:
+        - matchLabels:
+            app: mem0
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+    # Private metasearch backend for Web Search.
+    - toEndpoints:
+        - matchLabels:
+            app: searxng
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    # OpenWebUI needs egress to the internet on first boot to download the
+    # sentence-transformers embedding model for RAG, plus runtime calls for
+    # web search, citation fetching, and any external tool integrations.
+    # Without this, the pod hangs after printing its banner with no error
+    # and the startupProbe times out.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "80"
+              protocol: TCP
+---
+# SearXNG: only OpenWebUI may query it; search engines are reached over the
+# public web. DNS is allowed by the namespace-wide allow-dns policy above.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: searxng
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app: searxng
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/instance: open-webui
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+  egress:
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "80"
+              protocol: TCP
+---
+# LiteLLM: ingress from open-webui; egress to db, ollama, + external LLM APIs.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: litellm
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app: litellm
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/instance: open-webui
+        - matchLabels:
+            app: hermes-agent
+        - matchLabels:
+            app: hermes-workspace
+        # mem0 routes its extraction LLM through LiteLLM.
+        - matchLabels:
+            app: mem0
+      toPorts:
+        - ports:
+            - port: "4000"
+              protocol: TCP
+    # LAN access to the LiteLLM UI via NodePort 31031 -> 4000. NodePort traffic
+    # arrives SNAT'd from the node, which Cilium classifies as "world". This is
+    # intentionally wide; the node itself is only reachable on the LAN, and the
+    # UI still requires the master key to log in.
+    - fromEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "4000"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: litellm-db
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: ollama
+      toPorts:
+        - ports:
+            - port: "11434"
+              protocol: TCP
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "11434"
+              protocol: TCP
+    # mem0 service for the custom callback (Path A).
+    - toEndpoints:
+        - matchLabels:
+            app: mem0
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+    # External provider APIs. FQDN matching requires Cilium DNS proxy
+    # (enabled by default when hubble is on).
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "80"
+              protocol: TCP
+---
+# Ollama: ingress from open-webui + litellm + LAN NodePort; egress for model downloads.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: ollama
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app: ollama
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/instance: open-webui
+        - matchLabels:
+            app: litellm
+        # mem0 calls ollama for embeddings (nomic-embed-text).
+        - matchLabels:
+            app: mem0
+      toPorts:
+        - ports:
+            - port: "11434"
+              protocol: TCP
+    # Prometheus scrapes /metrics.
+    - fromEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": monitoring
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "11434"
+              protocol: TCP
+    # LAN access to ollama via NodePort 31434 -> 11434. NodePort traffic
+    # arrives SNAT'd from the node, which Cilium classifies as "world".
+    # Intentionally wide; the nodes are only reachable on the LAN/tailnet.
+    # Ollama itself has no auth, which is fine for a trusted LAN but worth
+    # knowing — anyone on the network can call this.
+    - fromEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "11434"
+              protocol: TCP
+  egress:
+    # Pull models from the ollama registry over HTTPS.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "80"
+              protocol: TCP
+---
+# Postgres for LiteLLM: only LiteLLM may talk to it.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: litellm-db
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app: litellm-db
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: litellm
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+---
+# Cloudflared: needs egress to the Cloudflare edge (UDP/7844 + HTTPS/443) and
+# inbound proxying to open-webui:8080. Nothing else should talk to it.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: cloudflared
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflare-tunnel
+  egress:
+    # Tunnel control plane + QUIC.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "7844"
+              protocol: UDP
+            - port: "7844"
+              protocol: TCP
+            - port: "443"
+              protocol: TCP
+    # Forward requests into the cluster to open-webui.
+    - toEndpoints:
+        - matchLabels:
+            app.kubernetes.io/instance: open-webui
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+---
+# MCP telemetry: ingress from LiteLLM / open-webui; egress to kube-api.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: mcp-telemetry
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app: mcp-telemetry
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: litellm
+        - matchLabels:
+            app.kubernetes.io/instance: open-webui
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+  egress:
+    - toEntities:
+        - kube-apiserver
+---
+# Hermes Agent: intentionally permissive. It's a general-purpose agent that
+# needs to call any in-cluster service, any external LLM provider, and any
+# URL hermes skills decide to hit. LAN clients reach it through NodePort
+# (Cilium classifies SNAT'd NodePort traffic as "world"). Inside the
+# cluster, hermes can talk to anything in ai-stack and reach the internet.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: hermes-agent
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app: hermes-agent
+  ingress:
+    # LAN/tailnet clients hitting NodePort 30642 (gateway) and 30119
+    # (dashboard).
+    - fromEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "8642"
+              protocol: TCP
+            - port: "9119"
+              protocol: TCP
+    # In-cluster callers can hit hermes directly via ClusterIP.
+    - fromEndpoints:
+        - {}
+      toPorts:
+        - ports:
+            - port: "8642"
+              protocol: TCP
+            - port: "9119"
+              protocol: TCP
+  egress:
+    # All in-cluster pods (ollama, litellm, mcp-telemetry, etc.). Locking
+    # this down would mean editing the policy every time a new skill is
+    # enabled — not the right trade-off for a personal agent.
+    - toEndpoints:
+        - {}
+    # Anywhere on the internet: Anthropic, OpenAI, Gemini, OpenRouter,
+    # plus URLs that skills fetch (web search, GitHub, arXiv, etc.).
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "80"
+              protocol: TCP
+    # Kube-apiserver in case a skill talks to the cluster directly.
+    - toEntities:
+        - kube-apiserver
+---
+# Hermes Workspace: chat UI that talks to hermes-agent. Receives LAN/tailnet
+# traffic via NodePort 30300, talks to hermes-agent over ClusterIP, and may
+# also fetch fonts/PWA assets/CDN scripts on first load.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: hermes-workspace
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app: hermes-workspace
+  ingress:
+    # LAN/tailnet clients hitting NodePort 30300.
+    - fromEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "3000"
+              protocol: TCP
+    # In-cluster callers (rare, but possible) via ClusterIP.
+    - fromEndpoints:
+        - {}
+      toPorts:
+        - ports:
+            - port: "3000"
+              protocol: TCP
+  egress:
+    # Talk to the hermes-agent gateway + dashboard on the cluster network.
+    - toEndpoints:
+        - matchLabels:
+            app: hermes-agent
+      toPorts:
+        - ports:
+            - port: "8642"
+              protocol: TCP
+            - port: "9119"
+              protocol: TCP
+    # External: workspace pulls fonts/icons/PWA assets and may proxy
+    # outbound for things like web previews. Keep this open.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "80"
+              protocol: TCP
+---
+# mem0 memory service: ingress from open-webui, LiteLLM, and LAN clients via
+# NodePort 31060. Egress to litellm (extraction LLM), ollama (embeddings), and
+# its own pgvector db. DNS is covered by the cluster-wide allow-dns policy.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: mem0
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app: mem0
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/instance: open-webui
+        # LiteLLM's mem0 callback (Path A) reaches mem0 from the gateway so
+        # OpenCode and any other LiteLLM-virtual-key client gets memory
+        # without each one needing its own filter.
+        - matchLabels:
+            app: litellm
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+    # LAN access via NodePort 31060 -> 8000. SNAT'd NodePort traffic is
+    # classified as "world" by Cilium. The API still requires MEM0_API_KEY.
+    - fromEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: litellm
+      toPorts:
+        - ports:
+            - port: "4000"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: ollama
+      toPorts:
+        - ports:
+            - port: "11434"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: mem0-db
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+---
+# Postgres for mem0: only the mem0 app may talk to it.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: mem0-db
+  namespace: ai-stack
+spec:
+  endpointSelector:
+    matchLabels:
+      app: mem0-db
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: mem0
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP

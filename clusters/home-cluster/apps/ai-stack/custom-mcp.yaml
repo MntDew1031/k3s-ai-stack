@@ -1,0 +1,108 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-telemetry-sa
+  namespace: ai-stack
+---
+# Tightened from a broad ClusterRole: only what the telemetry MCP actually
+# needs. Add verbs/resources as you hit permission errors, not preemptively.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-telemetry-role
+rules:
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-telemetry-binding
+subjects:
+  - kind: ServiceAccount
+    name: mcp-telemetry-sa
+    namespace: ai-stack
+roleRef:
+  kind: ClusterRole
+  name: mcp-telemetry-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-telemetry
+  namespace: ai-stack
+  labels:
+    app: mcp-telemetry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-telemetry
+  template:
+    metadata:
+      labels:
+        app: mcp-telemetry
+    spec:
+      serviceAccountName: mcp-telemetry-sa
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server
+          # Pin to a digest when you're confident — for now pin to a tag.
+          # Replace :latest once you've tagged a release of your own image.
+          image: example.invalid/portfolio/telemetry-mcp:REDACTED
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - containerPort: 8000
+              name: http
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-telemetry-svc
+  namespace: ai-stack
+  labels:
+    app: mcp-telemetry
+spec:
+  type: ClusterIP
+  selector:
+    app: mcp-telemetry
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+      name: http

@@ -1,0 +1,12 @@
+# Mem0 is pinned because major releases change the OSS API and memory algorithm.
+mem0ai==2.0.12
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+psycopg[binary]==3.3.4
+psycopg-pool==3.3.1
+ollama==0.6.2
+
+httpx==0.28.1
+anyio==4.7.0

@@ -1,0 +1,618 @@
+---
+# 1. PostgreSQL Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: litellm-db-pvc
+  namespace: ai-stack
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: "longhorn"
+  resources:
+    requests:
+      storage: 2Gi
+---
+# 2. PostgreSQL Database
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm-db
+  namespace: ai-stack
+  labels:
+    app: litellm-db
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: litellm-db
+  template:
+    metadata:
+      labels:
+        app: litellm-db
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          # Soft preference for control-03 to colocate with the litellm app pod
+          # for sub-ms query latency. If control-03 is down, the pod reschedules
+          # to any healthy node and Longhorn reattaches the PVC there (bump
+          # this volume to 3 replicas so a replica survives the node loss).
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - control-03
+      containers:
+        - name: postgres
+          # Pinned minor — bump intentionally.
+          image: postgres:15.8-alpine
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            - secretRef:
+                name: litellm-db-credentials
+          env:
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          ports:
+            - containerPort: 5432
+              name: postgres
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "litellm", "-d", "litellm"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "litellm", "-d", "litellm"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: db-data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: db-data
+          persistentVolumeClaim:
+            claimName: litellm-db-pvc
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm-db
+  namespace: ai-stack
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app: litellm-db
+---
+# 3. LiteLLM Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: ai-stack
+data:
+  config.yaml: |
+    model_list:
+      # Use ollama_chat/ (calls /api/chat) not ollama/ (/api/generate). The
+      # chat endpoint handles instruction-tuned models correctly; the legacy
+      # generate endpoint returns truncated chunked responses with modern
+      # llama3 / qwen chat variants, which surfaces as:
+      #   "TransferEncodingError: 400, Not enough data to satisfy transfer
+      #   length header."
+      - model_name: llama3.2:latest
+        litellm_params:
+          model: ollama_chat/llama3.2:latest
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: qwen3.6:27b
+        litellm_params:
+          model: ollama_chat/qwen3.6:27b
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: qwen2.5:7b
+        litellm_params:
+          model: ollama_chat/qwen2.5:7b
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: qwen3.5:9b
+        litellm_params:
+          model: ollama_chat/qwen3.5:9b
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: gemma4:e2b
+        litellm_params:
+          model: ollama_chat/gemma4:e2b
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: granite4.1:3b
+        litellm_params:
+          model: ollama_chat/granite4.1:3b
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: qwen3.5:4b
+        litellm_params:
+          model: ollama_chat/qwen3.5:4b
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: qwen3.5-9b-abliterated:latest
+        litellm_params:
+          model: ollama_chat/dmtx/qwen3.5-9b-abliterated:latest
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+      - model_name: qwen3.5-abliterated:4B
+        litellm_params:
+          model: ollama_chat/huihui_ai/qwen3.5-abliterated:4B
+          api_base: http://ollama.ai-stack.svc.cluster.local:11434
+    # SHADOW PC MODELS
+      - model_name: SP-ornith:35b
+        litellm_params:
+          model: openai/ornith_35b
+          api_base: http://192.0.2.30:11434/v1
+      - model_name: SP-gemma4:26b
+        litellm_params:
+          model: openai/gemma4_26b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-Hermes3:8b
+        litellm_params:
+          model: openai/Hermes3_8b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-qwen3.5:9b
+        litellm_params:
+          model: openai/qwen3.5_9b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-gemma4:e4b
+        litellm_params:
+          model: openai/gemma4_e4b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-huihui_ai/deepseek-r1-abliterated:14b
+        litellm_params:
+          model: openai/huihui_ai_deepseek-r1-abliterated_14b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-huihui_ai/qwen3.5-abliterated:9b
+        litellm_params:
+          model: openai/huihui_ai_qwen3.5-abliterated_9b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-huihui_ai/Qwen3.6-abliterated:27b
+        litellm_params:
+          model: openai/huihui_ai_Qwen3.6-abliterated_27b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-qwen3.6:35b
+        litellm_params:
+          model: openai/Qwen_Qwen3.6-35B-A3B-Q4_K_M
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          # The shadow PC currently runs this 24GB model with a 32K KV cache.
+          # Requests above this limit fail explicitly; LiteLLM never silently
+          # changes the model selected by the user.
+          max_input_tokens: 32768
+          supports_vision: true
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: primary-agent-llm
+        litellm_params:
+          model: openai/qwen3.6_35b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          max_input_tokens: 32768
+          supports_vision: true
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-mixtral:8x7b
+        litellm_params:
+          model: openai/mixtral_8x7b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-qwen2.5:32b-instruct-q4_0
+        litellm_params:
+          model: openai/qwen2.5_32b-instruct-q4_0
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-gemma3:12b-it-q8_0
+        litellm_params:
+          model: openai/gemma3_12b-it-q8_0
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-qwen2.5-coder:14b
+        litellm_params:
+          model: openai/qwen2.5-coder_14b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-deepseek-coder-v2:16b
+        litellm_params:
+          model: openai/deepseek-coder-v2_16b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-qwen2.5-coder:32b-instruct-q4_K_M
+        litellm_params:
+          model: openai/qwen2.5-coder_32b-instruct-q4_K_M
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      # Qwen3-Coder 30B MoE. Ollama's tool-call template support was fixed
+      # specifically for this generation. Use this as the local agentic
+      # coder; the qwen2.5-coder variants above keep emitting tool calls as
+      # text instead of structured tool_calls because their ollama template
+      # lacks proper tool tokens.
+      - model_name: SP-qwen3-coder:30b
+        litellm_params:
+          model: openai/qwen3-coder_30b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+      - model_name: SP-qwen3-coder:30b
+        litellm_params:
+          model: openai/qwen3-coder_30b
+          api_base: http://192.0.2.30:11434/v1
+        model_info:
+          supports_function_calling: true
+          supports_parallel_function_calling: true
+    # API MODELS
+      - model_name: gemini-3.1-pro-preview
+        litellm_params:
+          model: gemini/gemini-3.1-pro-preview
+          api_key: "os.environ/GEMINI_API_KEY"
+      - model_name: gemini-3.1-flash-preview
+        litellm_params:
+          model: gemini/gemini-3.1-flash-preview
+          api_key: "os.environ/GEMINI_API_KEY"
+      - model_name: gemini-3.1-flash-lite
+        litellm_params:
+          model: gemini/gemini-3.1-flash-lite
+          api_key: "os.environ/GEMINI_API_KEY"
+      # Prior generation Pro. On Tier 1, 2.5-pro has substantially higher
+      # per-day RPD than 3.1-pro (closer to ~1500/day vs 250/day), so this
+      # is the cheap escape hatch when 3.1-pro caps out during a busy day.
+      - model_name: gemini-2.5-pro
+        litellm_params:
+          model: gemini/gemini-2.5-pro
+          api_key: "os.environ/GEMINI_API_KEY"
+      - model_name: claude-opus-4.7
+        litellm_params:
+          model: anthropic/claude-opus-4-7
+          api_key: "os.environ/ANTHROPIC_API_KEY"
+      - model_name: claude-sonnet-4.6
+        litellm_params:
+          model: anthropic/claude-sonnet-4-6
+          api_key: "os.environ/ANTHROPIC_API_KEY"
+      - model_name: claude-haiku-4.5
+        litellm_params:
+          model: anthropic/claude-haiku-4-5
+          api_key: "os.environ/ANTHROPIC_API_KEY"
+      # OpenAI GPT-4.1 — used by the CMO persona for listing copy and
+      # marketing. Direct provider call, no OAuth needed.
+      - model_name: gpt-4.1
+        litellm_params:
+          model: openai/gpt-4.1
+          api_key: "os.environ/OPENAI_API_KEY"
+      - model_name: gpt-5-mini
+        litellm_params:
+          model: openai/gpt-5-mini
+          api_key: "os.environ/OPENAI_API_KEY"
+      # DeepSeek chat (V3.2 production, non-thinking). Use this for the
+      # CTO and other tool-heavy agents. Thinking mode is OFF by default
+      # so no reasoning_content round-trip is required, which sidesteps
+      # the LiteLLM multi-turn bug that breaks V4-Flash / V4-Pro
+      # (BerriAI/litellm#26395 — reasoning_content gets stripped from
+      # assistant messages on subsequent turns, then DeepSeek returns
+      # 400 "reasoning_content must be passed back to the API").
+      # deepseek/ provider prefix uses LiteLLM's first-class DeepSeek
+      # handler — no api_base override needed, no openai/ fallback path.
+      - model_name: deepseek-chat
+        litellm_params:
+          model: deepseek/deepseek-chat
+          api_key: "os.environ/DEEPSEEK_API_KEY"
+      # DeepSeek V4 Flash / Pro — kept registered for non-tool-loop use
+      # (e.g. CMO copywriting where it's a single-shot prompt). Switched
+      # to deepseek/ prefix so LiteLLM's DeepSeek transforms apply, and
+      # tried explicit thinking={type:disabled} via extra_body — DeepSeek
+      # docs only confirm "enabled" but disabled is worth trying since
+      # the alternative is thinking always-on and broken multi-turn.
+      # If you point an agent at these for tool dispatch you WILL hit
+      # the reasoning_content 400 on turn 2. Use deepseek-chat instead.
+      - model_name: deepseek-v4-flash
+        litellm_params:
+          model: deepseek/deepseek-v4-flash
+          api_key: "os.environ/DEEPSEEK_API_KEY"
+          extra_body:
+            thinking: {"type": "disabled"}
+      - model_name: deepseek-v4-pro
+        litellm_params:
+          model: deepseek/deepseek-v4-pro
+          api_key: "os.environ/DEEPSEEK_API_KEY"
+          extra_body:
+            thinking: {"type": "disabled"}
+    litellm_settings:
+      # Drop upstream errors instead of leaking provider URLs back to OWUI.
+      drop_params: true
+      # Require the master key on every request.
+      set_verbose: false
+      # Custom mem0 callback: injects relevant memories on inlet and stores
+      # the turn on outlet, but ONLY for virtual keys that have metadata
+      # mem0_enabled=true. mem0's own extraction LLM calls use the master
+      # key (no such metadata) and bypass this hook, which breaks the
+      # otherwise-obvious loop (mem0 -> litellm -> mem0 -> ...).
+      # See ai-stack/litellm-mem0-callback.py for the implementation.
+      callbacks:
+        - "mem0_callback.proxy_handler_instance"
+        - "context_callback.proxy_handler_instance"
+    general_settings:
+      # Do not let LiteLLM spin up an admin UI without a key.
+      ui_access_mode: "admin_only"
+      background_health_checks: false
+---
+# 4. LiteLLM Gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: ai-stack
+  labels:
+    app: litellm
+spec:
+  replicas: 1
+  # LiteLLM is stateless. Keep the current gateway serving until the new
+  # config revision has passed readiness for 10 seconds.
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      annotations:
+        # ConfigMap subPath mounts do not refresh or trigger a rollout. Bump
+        # this value whenever config.yaml changes intentionally.
+        ai-stack.example.com/config-revision: "2026-07-20-llama-cpp-update-3"
+      labels:
+        app: litellm
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          # Soft preference for control-03 so LiteLLM normally stays colocated
+          # with litellm-db and off gpu-worker-01 (reserved for ollama). If control-03
+          # is down it reschedules anywhere; LiteLLM is stateless (config is
+          # in a ConfigMap) so it has no volume to follow.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - control-03
+      containers:
+        - name: litellm
+          # Use the non_root variant: the standard image bakes the prisma
+          # query-engine binary into /root/.cache (mode 700, owned by root),
+          # which breaks when we run as UID 1000 with readOnlyRootFilesystem.
+          # The non_root variant relocates prisma binaries to a user-readable
+          # path. Pinned tag — bump intentionally.
+          # Bumped from v1.52.0 to fix ollama_chat streaming crash:
+          # "TypeError: sequence item 0: expected str instance, NoneType found"
+          # in ollama_async_streaming when ollama returns a chunk with
+          # content=None (happens with tool_calls and reasoning models).
+          # Surfaced as "empty response" in OpenAI-compat clients.
+          image: ghcr.io/berriai/litellm-non_root:v1.86.7
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config"
+            - "/app/config.yaml"
+            - "--port"
+            - "4000"
+            - "--num_workers"
+            - "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            - secretRef:
+                name: litellm-secrets
+          env:
+            # Build the DSN from the DB credentials Secret so nothing sensitive
+            # lives in the manifest.
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-db-credentials
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-db-credentials
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@litellm-db.ai-stack.svc.cluster.local:5432/litellm"
+            # prisma-python (bundled with litellm) wants to create
+            # $HOME/.cache/prisma-python/... on startup. With readOnlyRootFilesystem
+            # and no HOME set, HOME defaults to "/" and the mkdir blows up. Point
+            # HOME at /tmp (emptyDir, writable) and also give /.cache a writable
+            # mount as belt + suspenders.
+            - name: HOME
+              value: "/tmp"
+            - name: PRISMA_BINARY_CACHE_DIR
+              value: "/tmp/.cache/prisma-python/binaries"
+            # LiteLLM v1.83+ creates baseline migration files when it finds
+            # a pre-existing schema in Postgres (which we have from v1.52).
+            # Default path is inside the read-only image at
+            # /app/.venv/lib/python3.13/site-packages/litellm_proxy_extras/migrations/
+            # which fails with errno 30. Point at our writable /tmp emptyDir.
+            - name: LITELLM_MIGRATION_DIR
+              value: "/tmp/litellm-migrations"
+            # mem0 backend for the custom callback. MEM0_API_KEY rides in via
+            # envFrom litellm-secrets (add it to that Secret with the same
+            # value as ai-stack mem0-secrets MEM0_API_KEY, then sops re-encrypt).
+            - name: MEM0_BASE_URL
+              value: "http://mem0.ai-stack.svc.cluster.local:8000"
+            # Shared context safety for every present and future model alias.
+            # Explicit model metadata/overrides win; unknown models use a
+            # conservative 32K default. The selected model is never changed.
+            # 99% is calculated after reserving 4,096 tokens for the answer.
+            - name: CONTEXT_COMPACTION_THRESHOLD
+              value: "0.99"
+            - name: CONTEXT_COMPACTION_OUTPUT_RESERVE
+              value: "4096"
+            - name: CONTEXT_COMPACTION_KEEP_RECENT
+              value: "8192"
+            - name: CONTEXT_COMPACTION_TIMEOUT_S
+              value: "90"
+            - name: CONTEXT_COMPACTION_DEFAULT_LIMIT
+              value: "32768"
+            - name: CONTEXT_COMPACTION_LIMITS_JSON
+              value: '{"SP-qwen3.6:35b":32768,"primary-agent-llm":32768}'
+          ports:
+            - containerPort: 4000
+              name: http
+          startupProbe:
+            httpGet:
+              path: /health/liveness
+              port: 4000
+            failureThreshold: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/liveness
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              # Bumped from 256Mi: newer LiteLLM (v1.83+) bundles many more
+              # provider SDKs and loads them all on startup. 1Gi limit got
+              # OOM-killed before the HTTP server could bind. 2Gi req / 3Gi
+              # limit gives plenty of headroom for boot AND for concurrent
+              # streaming requests.
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "5Gi"
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            # Mount the kustomize-generated mem0 callback as an importable
+            # module right under /app (the litellm working dir, which is on
+            # the Python import path).
+            - name: mem0-callback
+              mountPath: /app/mem0_callback.py
+              subPath: mem0_callback.py
+            - name: mem0-callback
+              mountPath: /app/context_callback.py
+              subPath: context_callback.py
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /.cache
+      volumes:
+        - name: config
+          configMap:
+            name: litellm-config
+        - name: mem0-callback
+          configMap:
+            name: litellm-mem0-callback
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: ai-stack
+spec:
+  # NodePort so the UI is reachable on http://<any-node-ip>:31031/ui/ from the
+  # LAN. OpenWebUI still talks to this over the ClusterIP on port 4000 inside
+  # the cluster — NodePort includes ClusterIP, nothing breaks.
+  type: NodePort
+  ports:
+    - port: 4000
+      targetPort: 4000
+      nodePort: 31031
+      name: http
+  selector:
+    app: litellm

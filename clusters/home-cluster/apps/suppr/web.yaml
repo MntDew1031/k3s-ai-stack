@@ -1,0 +1,84 @@
+# Suppr web — ClusterIP Service + Deployment + PodDisruptionBudget.
+#
+# nginx-unprivileged serving the Next.js STATIC export. Stateless, so it runs
+# 2 replicas with a zero-downtime RollingUpdate and a PDB that keeps 1 up
+# during node drains. NEXT_PUBLIC_API_URL is baked at image BUILD time (see
+# the build-arg note below) — bumping this tag ships a new frontend bundle.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: suppr
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: suppr
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: regcred
+      containers:
+        # nginx-unprivileged serving the Next.js static export. NEXT_PUBLIC_API_URL
+        # is baked at image build time:
+        #   docker build --build-arg NEXT_PUBLIC_API_URL=https://api.app.example.com \
+        #     -t example.invalid/private/frontend:REDACTED web/
+        - name: web
+          image: example.invalid/private/frontend:REDACTED
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet: { path: /, port: 3000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: 3000 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1000m", memory: "1Gi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+---
+# Keep at least one web replica serving during a node drain or upgrade.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+  namespace: suppr
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: web

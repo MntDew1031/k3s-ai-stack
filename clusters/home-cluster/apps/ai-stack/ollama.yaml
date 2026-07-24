@@ -1,0 +1,156 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ai-stack
+  labels:
+    app: ollama
+spec:
+  # NodePort so LAN clients (hermes-agent on other machines, scripts, etc.)
+  # can reach ollama at http://<any-node-ip>:31434/v1 — the /v1 path is
+  # ollama's built-in OpenAI-compatible API. No auth.
+  # Example: http://192.0.2.50:31434/v1
+  # In-cluster callers (open-webui, litellm) keep using the ClusterIP at
+  # ollama.ai-stack.svc.cluster.local:11434 — NodePort includes ClusterIP
+  # so nothing else breaks.
+  type: NodePort
+  ports:
+    - port: 11434
+      targetPort: 11434
+      nodePort: 31434
+      name: http
+  selector:
+    app: ollama
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ollama
+  namespace: ai-stack
+  labels:
+    app: ollama
+spec:
+  serviceName: "ollama"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      # Run under the NVIDIA container runtime so nvidia-container-runtime
+      # injects /dev/nvidia* + the CUDA libraries into the container. Without
+      # this the scheduler still grants the nvidia.com/gpu reservation, but the
+      # pod runs under plain runc, the GPU is never injected, and ollama
+      # silently falls back to 100% CPU. The `nvidia` RuntimeClass is created
+      # by k3s when it auto-detects nvidia-container-runtime on the host; if
+      # gpu-worker-01 is ever rebuilt, restart k3s so it regenerates the containerd
+      # nvidia runtime block before this pod can schedule.
+      runtimeClassName: nvidia
+      securityContext:
+        # ollama's image still runs as root by default, so we pin a safe UID.
+        # If this breaks model loading on your distro, bump the fsGroup and
+        # chown /root/.ollama inside an initContainer.
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          # Hard requirement: ollama needs the NVIDIA Quadro P1000, which
+          # only exists on gpu-worker-01 (labeled gpu-vendor=nvidia). This is a
+          # hardware constraint, not a placement preference, so it stays
+          # required. Scheduling by the GPU label rather than the hostname
+          # means that if you ever add a second NVIDIA node, ollama can fail
+          # over to it automatically. With a single GPU node, ollama cannot
+          # be HA: if gpu-worker-01 is down, ollama stays Pending until it returns.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: gpu-vendor
+                    operator: In
+                    values:
+                      - nvidia
+      containers:
+        - name: ollama
+          # Pinned tag — bump intentionally. `latest` is forbidden here.
+          # 0.5.4 could not load qwen35 / qwen3.6 architecture models.
+          image: ollama/ollama:0.21.2
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            # rootfs stays writable — ollama needs /root/.ollama and /tmp.
+            readOnlyRootFilesystem: false
+          env:
+            - name: OLLAMA_NUM_PARALLEL
+              value: "1"
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "3"
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+            # Point ollama at a writable path under our PVC — we're running
+            # non-root, so /root/.ollama is not usable.
+            - name: OLLAMA_MODELS
+              value: "/models"
+            - name: HOME
+              value: "/models"
+            # Allow in-cluster callers AND LAN clients hitting the NodePort.
+            # OLLAMA_ORIGINS gates BOTH CORS (browsers) and Host-header checks
+            # (any HTTP client). Server-to-server callers like LiteLLM and
+            # OpenWebUI still work even without their entries because they're
+            # going through the ClusterIP DNS name, but explicit is better.
+            # The "*" entry covers hermes-agent and any other LAN client
+            # hitting http://<node-ip>:31434/v1 without us hard-coding every
+            # workstation IP. Safe on a trusted LAN; revisit if exposing
+            # beyond the tailnet.
+            - name: OLLAMA_ORIGINS
+              value: "*,http://ollama.ai-stack.svc.cluster.local,http://litellm.ai-stack.svc.cluster.local,http://open-webui.ai-stack.svc.cluster.local"
+          ports:
+            - containerPort: 11434
+              name: http
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "4Gi"
+            limits:
+              # gpu-worker-01's Quadro P1000 has only 4GB VRAM. ollama offloads as many
+              # model layers as fit; anything over ~3.5GB after quantization
+              # spills the remaining layers to system RAM (partial GPU offload).
+              nvidia.com/gpu: 1
+              # 20Gi cap so a large model (e.g. qwen3.6:27b, ~17GB on disk and
+              # larger in RAM during inference) doesn't get OOM-killed
+              # mid-generation. gpu-worker-01 has ~23Gi total, leaving ~3Gi for the host
+              # — tight; drop this if gpu-worker-01 shows memory pressure.
+              memory: "20Gi"
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          volumeMounts:
+            - mountPath: /models
+              name: models
+  volumeClaimTemplates:
+    - metadata:
+        name: models
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        storageClassName: "longhorn"
+        resources:
+          requests:
+            storage: 80Gi

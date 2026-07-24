@@ -1,0 +1,150 @@
+# Nightly Postgres backups. Two stages:
+#   1. initContainer: pg_dump (custom format, compressed) to a dedicated
+#      Longhorn PVC — 14-day local retention.
+#   2. container: rclone copies the fresh dump to Cloudflare R2 — 30-day
+#      OFF-SITE retention. Skips cleanly (exit 0) until the R2_* keys exist in
+#      suppr-secrets, so this is safe to deploy before the bucket/token exist.
+#
+# R2 setup (one-time, Cloudflare dashboard): R2 -> create bucket
+# `suppr-backups` -> Manage API Tokens -> create token (Object Read & Write,
+# scoped to that bucket). Supply through the private secret-management
+# workflow:
+#   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
+#   R2_ENDPOINT (https://<account-id>.r2.cloudflarestorage.com)
+#
+# Restore procedure (works from ANY machine with the R2 token — that's the point):
+#   rclone/aws-cli download the newest suppr-*.dump from the bucket, then:
+#   pg_restore -h <postgres> -U suppr -d suppr --clean --if-exists <file>
+#   (In-cluster: see the pg-restore pod override in git history, or run a
+#   throwaway pod with the pg-backup label to pass netpol.)
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: suppr-pg-backups
+  namespace: suppr
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pg-backup
+  namespace: suppr
+spec:
+  # 09:15 UTC = 2:15am Arizona (no DST there), quiet hours for a dinner app.
+  schedule: "15 9 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 900
+      template:
+        metadata:
+          labels:
+            app: pg-backup   # netpol: egress to example.invalid/third-party/database:PINNED_VERSION + HTTPS (R2)
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999          # postgres uid in the official image
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: pg-dump
+              image: example.invalid/third-party/database:PINNED_VERSION
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  # Fresh pods can race Cilium endpoint/DNS readiness for a few
+                  # seconds; wait for resolution instead of burning a Job retry.
+                  for i in $(seq 1 12); do
+                    nslookup postgres.suppr.svc.cluster.local >/dev/null 2>&1 && break
+                    echo "waiting for DNS (${i})"; sleep 5
+                  done
+                  ts="$(date +%Y%m%d-%H%M%S)"
+                  out="/backups/suppr-${ts}.dump"
+                  echo "dumping to ${out}"
+                  pg_dump -h postgres.suppr.svc.cluster.local -U "${POSTGRES_USER}" \
+                    -d "${POSTGRES_DB}" --format=custom --compress=9 --file="${out}"
+                  # Fail loudly on empty output rather than "succeeding" with nothing.
+                  test -s "${out}"
+                  echo "pruning local dumps older than 14 days (and empty failures)"
+                  find /backups -name 'suppr-*.dump' -mtime +14 -delete
+                  find /backups -name 'suppr-*.dump' -empty -delete
+                  echo "local backups:"; ls -lh /backups
+              env:
+                - name: POSTGRES_USER
+                  valueFrom: { configMapKeyRef: { name: suppr-config, key: POSTGRES_USER } }
+                - name: POSTGRES_DB
+                  valueFrom: { configMapKeyRef: { name: suppr-config, key: POSTGRES_DB } }
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: suppr-secrets, key: POSTGRES_PASSWORD } }
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+              resources:
+                requests: { cpu: "50m", memory: "128Mi" }
+                limits: { cpu: "500m", memory: "512Mi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]
+          containers:
+            - name: offsite
+              image: example.invalid/third-party/backup-client:PINNED_VERSION
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  if [ -z "${RCLONE_CONFIG_R2_ACCESS_KEY_ID:-}" ]; then
+                    echo "R2 credentials not configured — local backup only, skipping off-site copy."
+                    exit 0
+                  fi
+                  latest="$(ls -t /backups/suppr-*.dump | head -1)"
+                  echo "uploading $(basename "${latest}") to R2 bucket ${R2_BUCKET}"
+                  rclone copyto "${latest}" "r2:${R2_BUCKET}/$(basename "${latest}")"
+                  echo "pruning R2 dumps older than 30 days"
+                  rclone delete "r2:${R2_BUCKET}" --min-age 30d
+                  echo "off-site backups:"; rclone ls "r2:${R2_BUCKET}" | tail -10
+              env:
+                # rclone remote "r2" defined entirely via env — no config file.
+                - name: RCLONE_CONFIG_R2_TYPE
+                  value: "s3"
+                - name: RCLONE_CONFIG_R2_PROVIDER
+                  value: "Cloudflare"
+                # Bucket-scoped R2 tokens can't HeadBucket/CreateBucket, and
+                # rclone's default pre-upload bucket check needs that -> 403
+                # AccessDenied. Skip the check; the bucket exists.
+                - name: RCLONE_CONFIG_R2_NO_CHECK_BUCKET
+                  value: "true"
+                - name: RCLONE_CONFIG_R2_ACCESS_KEY_ID
+                  valueFrom: { secretKeyRef: { name: suppr-secrets, key: R2_ACCESS_KEY_ID, optional: true } }
+                - name: RCLONE_CONFIG_R2_SECRET_ACCESS_KEY
+                  valueFrom: { secretKeyRef: { name: suppr-secrets, key: R2_SECRET_ACCESS_KEY, optional: true } }
+                - name: RCLONE_CONFIG_R2_ENDPOINT
+                  valueFrom: { secretKeyRef: { name: suppr-secrets, key: R2_ENDPOINT, optional: true } }
+                - name: R2_BUCKET
+                  value: "suppr-backups"
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                  readOnly: true
+              resources:
+                requests: { cpu: "50m", memory: "64Mi" }
+                limits: { cpu: "500m", memory: "256Mi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: suppr-pg-backups

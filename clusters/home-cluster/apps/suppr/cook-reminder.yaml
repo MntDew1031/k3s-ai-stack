@@ -1,0 +1,51 @@
+# "Cooked it? Update your pantry" reminder. Runs the api image's
+# `app.jobs.cook_reminder` module hourly: ~3h after a household member's set
+# dinner time, if that day's vote closed with a winner and isn't reconciled,
+# it pushes everyone to update the pantry (once, via reconcile_prompted).
+#
+# Hourly on the hour; the module is a fast no-op when nothing is due, so 24
+# runs/day is cheap. Inert until APNs secrets exist (logs and exits 0).
+# NB: bump this image tag together with api.yaml on each release.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cook-reminder
+  namespace: suppr
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            app: cook-reminder   # netpol: egress to postgres + APNs (443)
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: regcred
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: cook-reminder
+              image: example.invalid/private/backend:REDACTED
+              command: ["python", "-m", "app.jobs.cook_reminder"]
+              envFrom:
+                - configMapRef: { name: suppr-config }
+                - secretRef: { name: suppr-secrets }
+              resources:
+                requests: { cpu: "50m", memory: "128Mi" }
+                limits: { cpu: "500m", memory: "512Mi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]

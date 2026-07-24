@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-stack
+  labels:
+    # Pod Security Standards. enforce is set to "baseline" instead of
+    # "restricted" specifically so that hermes-agent (a NousResearch image
+    # built on s6-overlay) can start as root long enough for s6 to chown
+    # /run, then drop to its runtime user. Restricted PSS forbids any
+    # container from starting as root, which s6-overlay's preinit cannot
+    # tolerate. Dropping enforce to baseline does NOT loosen any existing
+    # pod, because every other pod in this namespace (open-webui, litellm,
+    # mem0, ollama, cloudflared, custom-mcp) already sets its own
+    # restricted-compliant securityContext in its own spec. audit + warn
+    # stay at restricted so we keep getting warnings for any new pod that
+    # would have failed restricted admission.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

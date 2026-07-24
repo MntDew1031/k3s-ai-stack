@@ -1,0 +1,41 @@
+# Node disk-usage alerts. Prometheus selects ALL PrometheusRules
+# (ruleSelectorNilUsesHelmValues: false), so no special labels needed.
+# severity=critical routes to Discord via the alertmanager configSecret.
+# Thresholds: Longhorn stops scheduling replicas at ~75% used; kubelet
+# starts evicting pods at ~85% — alert before eviction, warn at the
+# Longhorn line.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: node-disk-usage
+  namespace: monitoring
+spec:
+  groups:
+    - name: node-disk
+      rules:
+        - alert: NodeRootDiskCritical
+          expr: |
+            100 * (1 - node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|rootfs"}
+              / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|rootfs"}) > 85
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Node {{ $labels.instance }} root disk over 85%"
+            description: >-
+              Root filesystem on {{ $labels.instance }} is {{ $value | printf "%.1f" }}% full.
+              kubelet evicts pods at ~85%; Longhorn already stopped scheduling replicas
+              at ~75%. Free space now (crictl rmi --prune, journalctl vacuum, or move a
+              Longhorn replica to gpu-worker-01).
+        - alert: NodeRootDiskHigh
+          expr: |
+            100 * (1 - node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|rootfs"}
+              / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|rootfs"}) > 78
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Node {{ $labels.instance }} root disk over 78%"
+            description: >-
+              {{ $labels.instance }} is past Longhorn's ~75% replica-scheduling reserve.
+              Not paging, but plan cleanup before it reaches the 85% eviction line.

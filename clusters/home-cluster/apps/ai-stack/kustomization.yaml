@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - ollama.yaml
+  - open-webui.yaml
+  - custom-mcp.yaml
+  - litellm.yaml
+  - mem0.yaml
+  - searxng.yaml
+  - hermes-agent.yaml
+  - hermes-workspace.yaml
+  - cloudflared.yaml
+  - network-policies.yaml
+  - hermes-obsidian-volume.yaml
+  - hermes-dropzone-volume.yaml
+
+# Generate the litellm-mem0-callback ConfigMap from the Python file so the
+# callback can evolve as plain Python (with linting/highlighting) instead of
+# being trapped in a YAML scalar. Kustomize appends a content hash to the
+# name, so editing the .py file produces a new ConfigMap name, which kustomize
+# also rewrites in the litellm Deployment reference, triggering an automatic
+# rollout of the litellm pod. No manual restart needed when the callback
+# changes.
+configMapGenerator:
+  - name: litellm-mem0-callback
+    # MUST be set: generators do not inherit a namespace from the kustomization,
+    # and an unnamespaced namespaced-kind resource gets rejected by the API
+    # server with "namespace not specified", which blocks the whole
+    # Flux Kustomization.
+    namespace: ai-stack
+    files:
+      - mem0_callback.py=litellm-mem0-callback.py
+      - context_callback.py=litellm-context-callback.py
+  - name: openwebui-context-meter
+    namespace: ai-stack
+    # HelmRelease values are not rewritten by Kustomize's name-reference
+    # transformer. Keep this name stable so the chart can mount it directly.
+    options:
+      disableNameSuffixHash: true
+    files:
+      - loader.js=openwebui-context-meter.js

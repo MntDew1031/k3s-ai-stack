@@ -1,0 +1,73 @@
+# Postgres 16 — headless Service + single-replica StatefulSet.
+#
+# The app's primary datastore. Data lives on a 5Gi Longhorn RWO volume
+# (volumeClaimTemplate). Credentials/DB name come from suppr-config +
+# suppr-secrets. Nightly logical backups are handled by pg-backup.yaml;
+# restore steps are documented there. Plan: migrate to managed Postgres
+# (Neon/RDS) at ~500 DAU — the Cloudflare tunnel makes that invisible to apps.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: suppr
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None  # headless — StatefulSet pods are addressable individually
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: suppr
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        fsGroup: 999  # postgres group inside the official image
+      containers:
+        - name: postgres
+          image: example.invalid/third-party/database:PINNED_VERSION
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom: { configMapKeyRef: { name: suppr-config, key: POSTGRES_USER } }
+            - name: POSTGRES_DB
+              valueFrom: { configMapKeyRef: { name: suppr-config, key: POSTGRES_DB } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: suppr-secrets, key: POSTGRES_PASSWORD } }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, suppr, -d, suppr]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1000m", memory: "1Gi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: longhorn
+        resources:
+          requests:
+            storage: 5Gi

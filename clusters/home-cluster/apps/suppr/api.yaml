@@ -1,0 +1,149 @@
+# Suppr API — ClusterIP Service + Deployment (FastAPI/uvicorn).
+#
+# Single replica with strategy: Recreate because it mounts the RWO Longhorn
+# uploads PVC (two pods can't attach it — see note by `replicas`). An
+# initContainer runs `alembic upgrade head` before the server starts, so
+# every deploy migrates the DB first. Config comes from the suppr-config
+# ConfigMap + suppr-secrets Secret. The image tag here MUST match the tag in
+# nudge.yaml, cook-reminder.yaml, and schedule-votes.yaml (all run the same image).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: suppr
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: suppr
+spec:
+  # replicas: 1 + Recreate because the api mounts the RWO Longhorn uploads PVC.
+  # A second replica (or a RollingUpdate surge pod) can't attach the same RWO
+  # volume and deadlocks. For HA later, switch uploads to a RWX volume.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: regcred
+      # initContainer runs Alembic migrations before the API starts.
+      initContainers:
+        - name: migrate
+          image: example.invalid/private/backend:REDACTED
+          imagePullPolicy: IfNotPresent
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef: { name: suppr-config }
+            - secretRef: { name: suppr-secrets }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      containers:
+        - name: api
+          image: example.invalid/private/backend:REDACTED
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef: { name: suppr-config }
+            - secretRef: { name: suppr-secrets }
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/uploads
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1000m", memory: "1Gi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # uvicorn writes to /tmp at startup
+            capabilities:
+              drop: [ALL]
+        # Off-site uploads backup (#112): user photos (recipes/avatars/result
+        # shots) are irreplaceable, so mirror them to R2 daily. Lives as a
+        # sidecar because the uploads PVC is RWO — only this pod can mount it.
+        # Shares the api's netpol identity (egress 443 already allowed).
+        # `--max-delete 200` aborts a sync that would mass-delete on R2, so a
+        # wiped/empty local volume can't erase the off-site copy.
+        - name: uploads-offsite
+          image: example.invalid/third-party/backup-client:PINNED_VERSION
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              if [ -z "${RCLONE_CONFIG_R2_ACCESS_KEY_ID:-}" ]; then
+                echo "R2 credentials not configured — uploads stay local-only."
+                sleep infinity
+              fi
+              sleep 120   # let the volume settle after pod start
+              while true; do
+                if [ -n "$(ls -A /uploads 2>/dev/null | grep -v lost+found)" ]; then
+                  echo "$(date -u +%FT%TZ) syncing uploads to r2:${R2_BUCKET}/uploads"
+                  rclone sync /uploads "r2:${R2_BUCKET}/uploads" \
+                    --exclude "lost+found/**" --max-delete 200 || true
+                  echo "$(date -u +%FT%TZ) sync done:"
+                  rclone size "r2:${R2_BUCKET}/uploads" || true
+                else
+                  echo "uploads volume empty — skipping sync (never mirror an empty source)"
+                fi
+                sleep 86400
+              done
+          env:
+            - name: RCLONE_CONFIG_R2_TYPE
+              value: "s3"
+            - name: RCLONE_CONFIG_R2_PROVIDER
+              value: "Cloudflare"
+            - name: RCLONE_CONFIG_R2_NO_CHECK_BUCKET
+              value: "true"
+            - name: RCLONE_CONFIG_R2_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: suppr-secrets, key: R2_ACCESS_KEY_ID, optional: true } }
+            - name: RCLONE_CONFIG_R2_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: suppr-secrets, key: R2_SECRET_ACCESS_KEY, optional: true } }
+            - name: RCLONE_CONFIG_R2_ENDPOINT
+              valueFrom: { secretKeyRef: { name: suppr-secrets, key: R2_ENDPOINT, optional: true } }
+            - name: R2_BUCKET
+              value: "suppr-backups"
+          volumeMounts:
+            - name: uploads
+              mountPath: /uploads
+              readOnly: true
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+            limits: { cpu: "300m", memory: "128Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: suppr-uploads

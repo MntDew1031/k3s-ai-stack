@@ -1,0 +1,324 @@
+---
+# mem0 memory service for the ai-stack.
+#
+# Consumers:
+#   1. The cluster open-webui (in-cluster, via ClusterIP DNS).
+#   2. The shadow12 gaming-PC open-webui (LAN, via NodePort 31060).
+#   3. LiteLLM's mem0 callback (Path A), giving OpenCode & co. memory.
+#
+# Backed by a dedicated pgvector Postgres (mem0-db). The extraction LLM is
+# routed through LiteLLM (so it can be an API model or a local ollama model,
+# switchable via MEM0_LLM_MODEL). Embeddings go straight to the ollama pod
+# (nomic-embed-text, 768 dims). LiteLLM does not proxy an embeddings model,
+# which is why the embedder bypasses it.
+#
+# PRE-REQ: the ollama pod must have the embed model pulled once:
+#   kubectl -n ai-stack exec deploy/ollama -- ollama pull nomic-embed-text
+
+# ---------------------------------------------------------------------------
+# 1. pgvector Postgres (mem0-db)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mem0-db-pvc
+  namespace: ai-stack
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: "longhorn"
+  resources:
+    requests:
+      storage: 3Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mem0-db
+  namespace: ai-stack
+  labels:
+    app: mem0-db
+spec:
+  replicas: 1
+  # RWO PVC: never roll a second pod onto the volume at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mem0-db
+  template:
+    metadata:
+      labels:
+        app: mem0-db
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # pgvector/pgvector:pg16 is debian-based; its postgres user is uid 999
+        # (the alpine litellm-db uses 70). Match the image or initdb fails.
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          # Moved to control-03 on 2026-05-30: worker-01 spiked to ~92% memory.
+          # control-03 now has the most headroom (was running hot earlier but
+          # hermes-workspace is the heavy ai-stack pod on worker-01 now).
+          # Mem0 app + db stay colocated for low-latency vector lookups.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - control-03
+      containers:
+        - name: postgres
+          # pgvector compiled into postgres 16. Pinned — bump intentionally.
+          image: pgvector/pgvector:pg16
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            # If this pod ever crashloops complaining about a read-only file
+            # system during initdb, flip this to false (the debian entrypoint
+            # is fussier than the alpine one). Tested pattern mirrors litellm-db.
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            # Injects POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB.
+            # (MEM0_API_KEY also rides along in this secret but is ignored here.)
+            - secretRef:
+                name: mem0-secrets
+          env:
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          ports:
+            - containerPort: 5432
+              name: postgres
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mem0", "-d", "mem0"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mem0", "-d", "mem0"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: db-data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: db-data
+          persistentVolumeClaim:
+            claimName: mem0-db-pvc
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mem0-db
+  namespace: ai-stack
+  labels:
+    app: mem0-db
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app: mem0-db
+---
+# ---------------------------------------------------------------------------
+# 2. mem0 REST service
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mem0
+  namespace: ai-stack
+  labels:
+    app: mem0
+spec:
+  replicas: 1
+  # Stateless app tier: keep the current pod serving until its replacement
+  # has been Ready for 10 seconds. This makes image updates zero-downtime.
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: mem0
+  template:
+    metadata:
+      labels:
+        app: mem0
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          # control-03 used to be excluded here with a hard NotIn rule: mem0 kept
+          # segfaulting on it (exit 139) while importing native Python wheels.
+          # Root-caused 2026-07-18 to a FAULTY 16G DIMM on control-03 — large
+          # mmap'd wheel loads were landing on bad memory. The stick was
+          # replaced and control-03 verified clean (memtester + 18h with zero
+          # kernel memory BUGs), so the exclusion is gone and mem0 can once
+          # again schedule anywhere. Soft gpu-worker-01 preference kept for locality.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - gpu-worker-01
+      containers:
+        - name: mem0
+          # Built from sources/mem0-service/. Bump tag when you push a new image.
+          image: example.invalid/portfolio/memory-service:REDACTED
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            # mem0 writes a SQLite history db + may write a small cache;
+            # keep the rootfs writable for those local files.
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            # --- Postgres / pgvector ---
+            - name: MEM0_PG_HOST
+              value: "mem0-db.ai-stack.svc.cluster.local"
+            - name: MEM0_PG_PORT
+              value: "5432"
+            - name: MEM0_PG_DB
+              valueFrom:
+                secretKeyRef:
+                  name: mem0-secrets
+                  key: POSTGRES_DB
+            - name: MEM0_PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mem0-secrets
+                  key: POSTGRES_USER
+            - name: MEM0_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mem0-secrets
+                  key: POSTGRES_PASSWORD
+            # --- Extraction LLM (through LiteLLM) ---
+            # Swap to a local model anytime, e.g. "qwen3.5:9b" or
+            # "llama3.2:latest"; it just has to be a name LiteLLM serves.
+            - name: MEM0_LLM_MODEL
+              value: "llama3.2:latest"
+            - name: MEM0_LLM_BASE_URL
+              value: "http://litellm.ai-stack.svc.cluster.local:4000/v1"
+            - name: MEM0_LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: LITELLM_MASTER_KEY
+            # --- Embedder (straight to ollama, NOT through LiteLLM) ---
+            - name: MEM0_EMBED_MODEL
+              value: "nomic-embed-text"
+            - name: MEM0_EMBED_DIMS
+              value: "768"
+            - name: MEM0_OLLAMA_BASE_URL
+              value: "http://ollama.ai-stack.svc.cluster.local:11434"
+            # --- Service auth + misc ---
+            - name: MEM0_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mem0-secrets
+                  key: MEM0_API_KEY
+            - name: MEM0_HISTORY_DB
+              value: "/data/history.db"
+            - name: MEM0_TELEMETRY
+              value: "False"
+            - name: HOME
+              value: "/data"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        # History db + any stray cache. Ephemeral; the real memories live in
+        # pgvector and survive restarts.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mem0
+  namespace: ai-stack
+  labels:
+    app: mem0
+spec:
+  # NodePort gives both an in-cluster ClusterIP (for the cluster open-webui
+  # and the integrations service) AND a LAN port for the shadow12 open-webui.
+  # In-cluster:  http://mem0.ai-stack.svc.cluster.local:8000
+  # LAN:         http://<any-node-ip>:31060
+  type: NodePort
+  ports:
+    - port: 8000
+      targetPort: 8000
+      nodePort: 31060
+      name: http
+  selector:
+    app: mem0

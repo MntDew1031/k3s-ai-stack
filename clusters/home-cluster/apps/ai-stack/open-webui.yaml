@@ -1,0 +1,227 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: open-webui
+  namespace: ai-stack
+spec:
+  interval: 1h
+  url: https://helm.openwebui.com/
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: open-webui
+  namespace: ai-stack
+spec:
+  interval: 1h
+  timeout: 15m
+  # Default remediation.retries is 0, which means a single failed upgrade
+  # jams the controller with "exceeded maximum retries: cannot remediate
+  # failed release" and stops further reconciles until you manually
+  # suspend/resume. Three retries with cleanup on remediation gives Flux
+  # room to recover after transient pod startup errors.
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+      remediateLastFailure: true
+    cleanupOnFail: true
+  chart:
+    spec:
+      chart: open-webui
+      # Pin chart tightly — change intentionally, not floaty.
+      version: "15.2.0"
+      sourceRef:
+        kind: HelmRepository
+        name: open-webui
+  values:
+    # Keep the current single RWO-backed pod running when Flux changes the pod
+    # template. The new template is used on the next deliberate recreation;
+    # meanwhile the loader can be activated in the live pod without a restart.
+    strategy:
+      type: OnDelete
+
+    image:
+      # Pinned image tag — bump intentionally.
+      tag: "v0.10.2"
+      pullPolicy: IfNotPresent
+
+    persistence:
+      enabled: true
+      size: 5Gi
+      storageClass: "longhorn"
+
+    ollama:
+      enabled: false
+    pipelines:
+      enabled: false
+
+    # One Open WebUI replica does not need a separate Redis deployment. Keep
+    # websocket support enabled with its built-in in-memory manager.
+    websocket:
+      enabled: true
+      manager: ""
+      redis:
+        enabled: false
+
+    ollamaUrls:
+      - "http://ollama.ai-stack.svc.cluster.local:11434"
+
+    # Wire the LiteLLM gateway in as the OpenAI endpoint via the chart's native
+    # value, NOT extraEnvVars. The chart writes OPENAI_API_BASE_URL into the
+    # StatefulSet env from this key. Use the plural list form, not the
+    # singular string, since the chart expects an array here.
+    openaiBaseApiUrls:
+      - "http://litellm.ai-stack.svc.cluster.local:4000/v1"
+
+    # Application-level hardening. These become env vars for the pod.
+    extraEnvVars:
+      - name: OLLAMA_METRICS
+        value: "1"
+      # Lock down account creation and defaults.
+      - name: ENABLE_SIGNUP
+        value: "false"
+      - name: DEFAULT_USER_ROLE
+        value: "pending"
+      - name: ENABLE_COMMUNITY_SHARING
+        value: "false"
+      - name: ENABLE_ADMIN_EXPORT
+        value: "false"
+      - name: ENABLE_ADMIN_CHAT_ACCESS
+        value: "false"
+      - name: ENABLE_MESSAGE_RATING
+        value: "true"
+      # Session cookie hardening for behind-Cloudflare use.
+      - name: WEBUI_SESSION_COOKIE_SAME_SITE
+        value: "lax"
+      - name: WEBUI_SESSION_COOKIE_SECURE
+        value: "true"
+      # NOTE: WEBUI_AUTH_TRUSTED_EMAIL_HEADER is intentionally NOT set.
+      # If you turn it on, open-webui rejects every login with "Your provider
+      # has not provided a trusted header" unless Cloudflare Access (or another
+      # trusted proxy) is actually injecting the header. Re-enable this only
+      # AFTER you put Cloudflare Access in front of the tunnel.
+      # API key still belongs in extraEnvVars because it pulls from a Secret.
+      - name: OPENAI_API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: litellm-secrets
+            key: LITELLM_MASTER_KEY
+      # Provide the session-signing key explicitly. Without this, start.sh
+      # tries to generate one and write it to .webui_secret_key, which fails
+      # under readOnlyRootFilesystem=true and the app aborts at startup with
+      # "Required environment variable not found".
+      - name: WEBUI_SECRET_KEY
+        valueFrom:
+          secretKeyRef:
+            name: litellm-secrets
+            key: WEBUI_SECRET_KEY
+
+    # Kill the NodePort. cloudflared now targets the in-cluster Service DNS.
+    service:
+      type: ClusterIP
+      port: 80
+
+    serviceAccount:
+      create: true
+
+    # Pod-level hardening.
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      runAsNonRoot: true
+      capabilities:
+        drop: ["ALL"]
+
+    # Writable tmpfs mount for things that need scratch space.
+    # Chart 15.2.0 uses top-level `volumes:` (NOT `extraVolumes`) and a
+    # NESTED `volumeMounts:` map split between `initContainer:` and
+    # `container:` (NOT a flat list, NOT `extraVolumeMounts`). Without
+    # this mount, with readOnlyRootFilesystem=true, python's tempfile
+    # cannot find a writable /tmp and the app crashes during dill/torch
+    # import with: "FileNotFoundError: No usable temporary directory
+    # found in ['/tmp', '/var/tmp', '/usr/tmp', '/app/backend']".
+    volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: context-meter
+        configMap:
+          name: openwebui-context-meter
+    volumeMounts:
+      initContainer: []
+      container:
+        - name: tmp
+          mountPath: /tmp
+        # Open WebUI copies this build-time loader into its served static
+        # directory during startup. It injects the context ring client-side.
+        - name: context-meter
+          mountPath: /app/build/static/loader.js
+          subPath: loader.js
+          readOnly: true
+        # The hardened container runs as uid 1000, while the image's served
+        # static directory is root-owned. Mount the loader directly at the
+        # served path so startup does not need permission to copy it there.
+        - name: context-meter
+          mountPath: /app/backend/open_webui/static/loader.js
+          subPath: loader.js
+          readOnly: true
+
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "2"
+        memory: "2Gi"
+
+    # Open-webui v0.8.x loads torch + transformers + langchain on boot, which
+    # takes 60-120s on a cold start. A startupProbe gives the app up to 5
+    # minutes to become responsive before liveness/readiness even start
+    # checking. Without this, the 30s liveness initialDelay kills it
+    # mid-import and the pod CrashLoopBackOffs forever.
+    startupProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      failureThreshold: 30
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: http
+      periodSeconds: 30
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: http
+      periodSeconds: 10
+
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 50
+          preference:
+            matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+              - worker-01
+        - weight: 10
+          preference:
+            matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+              - control-01

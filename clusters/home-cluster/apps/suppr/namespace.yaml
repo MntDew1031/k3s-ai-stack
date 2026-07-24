@@ -1,0 +1,20 @@
+# The `suppr` namespace + Pod Security Standards labels.
+#
+# enforce=baseline (see the label comment) because the stock postgres/redis
+# images briefly start as root; audit/warn stay at restricted to flag any new
+# pod that wouldn't meet the stricter bar. Our own images run fully restricted.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: suppr
+  labels:
+    # PSS: enforce baseline (not restricted) because the official postgres and
+    # redis images start as root to init, then drop privileges. Restricted
+    # forbids starting as root and they crash-loop (same class of issue as
+    # hermes/s6 in ai-stack). audit + warn stay at restricted so any NEW pod
+    # that would fail restricted still gets flagged. Our own api/web/cloudflared
+    # set full restricted-compliant securityContexts in their own specs.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

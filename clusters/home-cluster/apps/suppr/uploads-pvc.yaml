@@ -1,0 +1,17 @@
+# Shared uploads volume for recipe photos + avatars (2Gi Longhorn RWO).
+#
+# Mounted by the api Deployment at /app/uploads and served via its /uploads
+# static mount. Being RWO is why the api is pinned to a single Recreate
+# replica (see api.yaml). Not in the nightly DB backup — files here are
+# regenerable/re-uploadable; DB rows referencing them are what's backed up.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: suppr-uploads
+  namespace: suppr
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi

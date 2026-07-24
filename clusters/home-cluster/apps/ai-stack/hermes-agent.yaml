@@ -1,0 +1,207 @@
+---
+# Hermes Agent: NousResearch agent runtime + dashboard, running in-cluster.
+# Soft-prefers control-03 (colocated with litellm + litellm-db) but reschedules
+# to any healthy node if control-03 is down — see the affinity block below.
+#
+# Endpoints (NodePort, reachable from any LAN/tailnet host):
+#   http://<any-node-ip>:30642   gateway API (HERMES_API_URL)
+#   http://<any-node-ip>:30119   dashboard API (HERMES_DASHBOARD_URL)
+#
+# Hermes config lives in the PVC at /opt/data — to seed credentials/settings
+# after the pod is up, either:
+#   kubectl -n ai-stack exec deploy/hermes-agent -- hermes config set KEY VAL
+# or hit the dashboard UI on :30119 from a browser.
+#
+# API keys come from the `hermes-secrets` Secret. Create that separately,
+# SOPS-encrypted, with at minimum:
+#   ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY (or GOOGLE_API_KEY)
+# Add OPENROUTER_API_KEY, GROQ_API_KEY, etc. as needed.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-data
+  namespace: ai-stack
+spec:
+  accessModes: [ "ReadWriteOnce" ]
+  storageClassName: "longhorn"
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-agent
+  namespace: ai-stack
+  labels:
+    app: hermes-agent
+spec:
+  replicas: 1
+  # PVC is RWO, so a rolling update would deadlock waiting for the old pod
+  # to release the volume. Recreate avoids that.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hermes-agent
+  template:
+    metadata:
+      labels:
+        app: hermes-agent
+    spec:
+      securityContext:
+        # The hermes image is built on s6-overlay, which insists on owning
+        # /run at preinit. To do that, the container must start as root.
+        # ai-stack's PSS enforce tier was lowered to "baseline" for exactly
+        # this reason; see namespace.yaml. s6 chowns runtime paths, then
+        # s6-applyuidgid drops to the in-image hermes user (uid 10000) for
+        # the actual hermes process. fsGroup matches that uid so the PVC
+        # mountpoint is group-owned correctly from the start and hermes can
+        # write to /opt/data without needing the chown step in cont-init.
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          # Soft preference for control-03 (alongside litellm + litellm-db) under
+          # normal conditions, but allow rescheduling to any healthy node if
+          # control-03 goes down. The hermes-data PVC has 3 Longhorn replicas, so
+          # the volume reattaches wherever the pod lands. gpu-worker-01 stays
+          # effectively reserved for ollama via its own GPU requirement.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - control-03
+      containers:
+        - name: hermes-agent
+          # `latest` is acceptable here for a personal homelab agent —
+          # bump intentionally for production.
+          image: nousresearch/hermes-agent:PINNED_VERSION
+          imagePullPolicy: Always
+          securityContext:
+            # NOTE: capabilities.drop is intentionally not set. The hermes
+            # image's s6-overlay init needs CAP_CHOWN to fix ownership of
+            # /opt/data and /run/s6-rc, and CAP_SETUID/SETGID for
+            # s6-applyuidgid to drop to the in-image hermes user (uid
+            # 10000). Dropping ALL caps gave us a "rootless container?"
+            # symptom: container ran as uid 0 but had no authority, so
+            # cont-init scripts kept exiting 111 in a loop. With baseline
+            # PSS we keep the standard capability set (CHOWN, SETUID,
+            # SETGID, FOWNER, DAC_OVERRIDE, etc., NOT NET_ADMIN/SYS_ADMIN).
+            allowPrivilegeEscalation: false
+            # The hermes CLI writes to ~/.hermes, /opt/data, and tmux
+            # session dirs, so we can't enable readOnlyRootFilesystem.
+            readOnlyRootFilesystem: false
+          # The image's ENTRYPOINT is already `hermes`, so we pass only the
+          # subcommand here via `args`. Matches the docker-compose example
+          # (`command: gateway run`, which is CMD = args in K8s land).
+          # Don't use `command:` here — that overrides ENTRYPOINT and the
+          # hermes binary path isn't on the default PATH for non-root.
+          args:
+            - "gateway"
+            - "run"
+          env:
+            # Spawns the dashboard subprocess on :9119 alongside the
+            # gateway. Without this, only :8642 is served.
+            - name: HERMES_DASHBOARD
+              value: "1"
+            # Bind to all interfaces so the gateway is reachable via the
+            # Service (default is loopback only in some versions).
+            - name: API_SERVER_HOST
+              value: "0.0.0.0"
+            - name: API_SERVER_ENABLED
+              value: "true"
+            # Point hermes at the in-cluster ollama and litellm by default.
+            # Override these per-profile via `hermes config` if needed.
+            - name: OLLAMA_BASE_URL
+              value: "http://ollama.ai-stack.svc.cluster.local:11434"
+            - name: OBSIDIAN_VAULT_PATH
+              value: "/mnt/obsidian/Obsidian Vault"
+          envFrom:
+            # Pulls API keys into env: ANTHROPIC_API_KEY, OPENAI_API_KEY,
+            # GEMINI_API_KEY/GOOGLE_API_KEY, OPENROUTER_API_KEY, etc.
+            # Anything in this Secret becomes an env var on the pod.
+            - secretRef:
+                name: hermes-secrets
+                optional: false
+          ports:
+            - containerPort: 8642
+              name: gateway
+            - containerPort: 9119
+              name: dashboard
+          # MAX-out resources for control-03 — hermes can burst into swarm
+          # workers + multiple concurrent model calls. Request stays
+          # modest so the scheduler isn't blocked from placing it.
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: gateway
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: gateway
+            initialDelaySeconds: 90
+            periodSeconds: 30
+          startupProbe:
+            httpGet:
+              path: /health
+              port: gateway
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 30
+          volumeMounts:
+            - name: data
+              mountPath: /opt/data
+            - name: obsidian-vault
+              mountPath: /mnt/obsidian
+            - name: dropzone
+              mountPath: /mnt/dropzone
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hermes-data
+        - name: obsidian-vault
+          persistentVolumeClaim:
+            claimName: obsidian-vault
+        - name: dropzone
+          persistentVolumeClaim:
+            claimName: hermes-dropzone
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-agent
+  namespace: ai-stack
+  labels:
+    app: hermes-agent
+spec:
+  # NodePort so any LAN/tailnet machine can hit the gateway + dashboard.
+  # In-cluster callers can also use the ClusterIP at
+  # hermes-agent.ai-stack.svc.cluster.local on the same target ports.
+  type: NodePort
+  ports:
+    - port: 8642
+      targetPort: 8642
+      nodePort: 30642
+      name: gateway
+    - port: 9119
+      targetPort: 9119
+      nodePort: 30119
+      name: dashboard
+  selector:
+    app: hermes-agent

@@ -1,0 +1,190 @@
+---
+# Private metasearch backend for OpenWebUI web search.
+#
+# OpenWebUI calls this service over ClusterIP DNS. SearXNG then queries its
+# configured public search engines and returns normalized JSON results. It is
+# intentionally not exposed through Cloudflare or a NodePort.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-config
+  namespace: ai-stack
+data:
+  settings.yml: |
+    use_default_settings: true
+
+    general:
+      debug: false
+      instance_name: "Obsidian Raven Search"
+
+    search:
+      # Moderate filtering is a safer default for model-generated queries.
+      safe_search: 1
+      autocomplete: ""
+      formats:
+        - html
+        - json
+
+    server:
+      # This is a private, machine-to-machine endpoint. Cilium limits callers
+      # to the OpenWebUI pods, so the public-instance limiter is unnecessary.
+      limiter: false
+      image_proxy: false
+      method: GET
+      # Overridden at runtime by the SEARXNG_SECRET environment variable.
+      secret_key: "overridden-by-SEARXNG_SECRET"
+
+    outgoing:
+      request_timeout: 10.0
+      max_request_timeout: 15.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searxng
+  namespace: ai-stack
+  labels:
+    app: searxng
+spec:
+  # Two replicas let searches continue during node maintenance and upgrades.
+  replicas: 2
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: searxng
+  template:
+    metadata:
+      labels:
+        app: searxng
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # The official image owns its runtime directories as searxng uid 977.
+        runAsUser: 977
+        runAsGroup: 977
+        fsGroup: 977
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: searxng
+      containers:
+        - name: searxng
+          # Official image pinned by immutable tag and multi-arch digest.
+          image: docker.io/searxng/searxng:2026.7.14-58e02a01a@sha256:af9aec5c8fe88767106e8043004a1232d43cabde22869e6355f3a63d26e41351
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: SEARXNG_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: searxng-secrets
+                  key: SEARXNG_SECRET
+            - name: SEARXNG_PORT
+              value: "8080"
+            - name: GRANIAN_HOST
+              value: "0.0.0.0"
+            - name: GRANIAN_WORKERS
+              value: "1"
+            # ConfigMap volumes are root-owned but readable by uid 977.
+            - name: FORCE_OWNERSHIP
+              value: "false"
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: X-Real-IP
+                  value: 127.0.0.1
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: X-Real-IP
+                  value: 127.0.0.1
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: X-Real-IP
+                  value: 127.0.0.1
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "192Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/searxng
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/searxng
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: searxng-config
+        - name: cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: searxng
+  namespace: ai-stack
+  labels:
+    app: searxng
+spec:
+  type: ClusterIP
+  selector:
+    app: searxng
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: searxng
+  namespace: ai-stack
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: searxng

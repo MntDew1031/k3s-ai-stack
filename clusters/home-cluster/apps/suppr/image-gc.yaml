@@ -1,0 +1,55 @@
+# Orphaned-upload garbage collection (weekly).
+#
+# Reclaims storage from recipe/takeout photos and avatars no longer referenced
+# by the DB. The sweep itself runs INSIDE the api pod (POST /internal/image-gc)
+# because the uploads PVC is ReadWriteOnce — a standalone job can't co-mount it
+# while api holds it. This CronJob is just a tiny curl that pokes the api's
+# in-cluster ClusterIP; the endpoint rejects anything arriving via the public
+# tunnel (Cf-Connecting-Ip header). No DB or volume access here, so no secrets.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: image-gc
+  namespace: suppr
+spec:
+  # Sundays 03:30 (cluster time). Non-urgent maintenance.
+  schedule: "30 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      # Give up rather than pile up if the api is briefly unreachable.
+      backoffLimit: 2
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            app: image-gc
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: trigger
+              image: example.invalid/third-party/http-client:PINNED_VERSION
+              command:
+                - curl
+                - "-fsS"
+                - "-X"
+                - "POST"
+                - "--max-time"
+                - "90"
+                - "http://api:8000/internal/image-gc"
+              resources:
+                requests: { cpu: "10m", memory: "16Mi" }
+                limits: { cpu: "100m", memory: "64Mi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]

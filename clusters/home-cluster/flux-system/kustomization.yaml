@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - gotk-components.yaml
+  - gotk-sync.yaml
+  - monitoring-kustomization.yaml
+  - gpu-kustomization.yaml
+  - ai-stack-kustomization.yaml
+  - cattle-system-kustomization.yaml
+  - storage-kustomization.yaml
+  - suppr-kustomization.yaml
+  - kube-vip-kustomization.yaml

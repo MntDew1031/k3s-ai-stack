@@ -1,0 +1,304 @@
+# Zero-trust network policy for suppr (mirrors the ai-stack pattern).
+# Default deny both directions, then allow the real call graph:
+#   cloudflared -> web:3000, api:8000, Cloudflare edge (world)
+#   web         -> DNS only (static nginx; the browser calls the API directly)
+#   api         -> example.invalid/third-party/database:PINNED_VERSION, example.invalid/third-party/cache:PINNED_VERSION, DNS, HTTPS world (Spoonacular,
+#                  TheMealDB, Open Food Facts, Resend)
+#   postgres    -> DNS ;  redis -> DNS
+# NOTE: Cilium policies are additive; allow-dns grants kube-dns egress to all.
+# L7 DNS rules intentionally omitted (they break DNS across node reboots here).
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny
+  namespace: suppr
+spec:
+  endpointSelector: {}
+  ingress:
+    - {}
+  egress:
+    - {}
+  ingressDeny:
+    - {}
+  egressDeny:
+    - {}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: suppr
+spec:
+  endpointSelector: {}
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": kube-system
+            "k8s:k8s-app": kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+---
+# cloudflared: out to the Cloudflare edge, and in-cluster to web + api.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: cloudflared
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflare-tunnel
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: web
+      toPorts:
+        - ports: [{ port: "3000", protocol: TCP }]
+    - toEndpoints:
+        - matchLabels:
+            app: api
+      toPorts:
+        - ports: [{ port: "8000", protocol: TCP }]
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - { port: "443", protocol: TCP }
+            - { port: "7844", protocol: TCP }
+            - { port: "7844", protocol: UDP }
+---
+# web: ingress from cloudflared only.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: web
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: web
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: cloudflare-tunnel
+      toPorts:
+        - ports: [{ port: "3000", protocol: TCP }]
+---
+# api: ingress from cloudflared; egress to postgres, redis, and HTTPS world.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: api
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: cloudflare-tunnel
+        # image-gc CronJob triggers POST /internal/image-gc in-cluster.
+        - matchLabels:
+            app: image-gc
+      toPorts:
+        - ports: [{ port: "8000", protocol: TCP }]
+    # Traefik terminates TLS for the permanent LAN-only :4646 /admin route.
+    - fromEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": kube-system
+            "k8s:app.kubernetes.io/instance": traefik-kube-system
+            "k8s:app.kubernetes.io/name": traefik
+      toPorts:
+        - ports: [{ port: "8000", protocol: TCP }]
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: postgres
+      toPorts:
+        - ports: [{ port: "5432", protocol: TCP }]
+    - toEndpoints:
+        - matchLabels:
+            app: redis
+      toPorts:
+        - ports: [{ port: "6379", protocol: TCP }]
+    - toEntities:
+        - world
+      toPorts:
+        - ports: [{ port: "443", protocol: TCP }]
+---
+# postgres: ingress from API and jobs that read/write Suppr state.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: postgres
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: postgres
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: api
+        - matchLabels:
+            app: pg-backup
+        - matchLabels:
+            app: nudge
+        - matchLabels:
+            app: cook-reminder
+        - matchLabels:
+            app: schedule-votes
+        - matchLabels:
+            app: weekly-digest
+      toPorts:
+        - ports: [{ port: "5432", protocol: TCP }]
+---
+# pg-backup CronJob: egress to postgres (dump) + HTTPS world (R2 off-site copy).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: pg-backup
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: pg-backup
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: postgres
+      toPorts:
+        - ports: [{ port: "5432", protocol: TCP }]
+    - toEntities:
+        - world
+      toPorts:
+        - ports: [{ port: "443", protocol: TCP }]
+---
+# nudge CronJob: postgres (device tokens/sessions) + HTTPS world (APNs).
+# Its pods deliberately do NOT carry app:api — that would enroll them in the
+# api Service's endpoints and blackhole real traffic while the job runs.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: nudge
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: nudge
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: postgres
+      toPorts:
+        - ports: [{ port: "5432", protocol: TCP }]
+    - toEntities:
+        - world
+      toPorts:
+        - ports: [{ port: "443", protocol: TCP }]
+---
+# weekly-digest CronJob: postgres (sessions/winners/tokens) + HTTPS world (APNs).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: weekly-digest
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: weekly-digest
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: postgres
+      toPorts:
+        - ports: [{ port: "5432", protocol: TCP }]
+    - toEntities:
+        - world
+      toPorts:
+        - ports: [{ port: "443", protocol: TCP }]
+---
+# cook-reminder CronJob: postgres (sessions/tokens/prefs) + HTTPS world (APNs).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: cook-reminder
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: cook-reminder
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: postgres
+      toPorts:
+        - ports: [{ port: "5432", protocol: TCP }]
+    - toEntities:
+        - world
+      toPorts:
+        - ports: [{ port: "443", protocol: TCP }]
+---
+# schedule-votes CronJob: postgres (schedules/options/tokens) + HTTPS world
+# (Spoonacular matching and APNs actionable notification).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: schedule-votes
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: schedule-votes
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: postgres
+      toPorts:
+        - ports: [{ port: "5432", protocol: TCP }]
+    - toEntities:
+        - world
+      toPorts:
+        - ports: [{ port: "443", protocol: TCP }]
+---
+# image-gc CronJob: only needs to reach the api ClusterIP (it triggers the
+# in-process orphaned-upload sweep via POST /internal/image-gc). DNS is granted
+# globally by allow-dns.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: image-gc
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: image-gc
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: api
+      toPorts:
+        - ports: [{ port: "8000", protocol: TCP }]
+---
+# redis: ingress from api only.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: redis
+  namespace: suppr
+spec:
+  endpointSelector:
+    matchLabels:
+      app: redis
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: api
+      toPorts:
+        - ports: [{ port: "6379", protocol: TCP }]

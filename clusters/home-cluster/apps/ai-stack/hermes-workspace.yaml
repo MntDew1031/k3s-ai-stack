@@ -1,0 +1,149 @@
+---
+# Hermes Workspace: the chat UI that connects to hermes-agent.
+# Soft-prefers worker-01 (keeps memory pressure off control-03, where the agent
+# runs); it only proxies to hermes-agent over cluster DNS, so it can run
+# anywhere and fails over freely. Accessed via NodePort 30300 from
+# any LAN/tailnet machine: http://<any-node-ip>:30300
+#
+# Auth: HERMES_PASSWORD is REQUIRED when binding to non-loopback (which we
+# always do — Service traffic comes through the cluster network). Without
+# it, the workspace refuses to start. Add HERMES_PASSWORD to hermes-secrets.
+#
+# This image talks to hermes-agent over the cluster Service DNS — no need
+# to use the NodePort or external IP for the workspace -> agent link.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-workspace
+  namespace: ai-stack
+  labels:
+    app: hermes-workspace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hermes-workspace
+  template:
+    metadata:
+      labels:
+        app: hermes-workspace
+    spec:
+      securityContext:
+        # PSS restricted-compliant. Workspace is a Node.js app that doesn't
+        # need root.
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          # Soft preference for worker-01 to relieve control-03's memory pressure
+          # under normal conditions. The workspace just proxies to
+          # hermes-agent over the cluster network and mounts the RWX
+          # obsidian-vault, so it can reschedule to any node if worker-01 is
+          # down (cross-node DNS adds ~1ms, fine for a chat UI).
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - worker-01
+      containers:
+        - name: hermes-workspace
+          # `latest` for a personal homelab — bump intentionally for prod.
+          image: ghcr.io/outsourc-e/hermes-workspace:PINNED_VERSION
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # Workspace proxies all /api/* calls server-side, so the
+            # browser never directly hits these URLs. The workspace pod
+            # uses cluster Service DNS to reach the agent — fast, no
+            # NodePort hairpin issues. (NodePort from a pod to its own
+            # node IP can fail under Cilium without specific config.)
+            - name: HERMES_API_URL
+              value: "http://hermes-agent.ai-stack.svc.cluster.local:8642"
+            - name: HERMES_DASHBOARD_URL
+              value: "http://hermes-agent.ai-stack.svc.cluster.local:9119"
+            # Bind to all interfaces so the Service can reach it. Default
+            # is loopback only.
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "3000"
+            # No TLS termination in the cluster; let cookies work over HTTP
+            # on LAN. Flip back to 1 if you put cloudflared/ingress with
+            # TLS in front.
+            - name: COOKIE_SECURE
+              value: "0"
+            # Trust X-Forwarded-* if you eventually proxy this behind
+            # cloudflared or a reverse proxy. Off for now.
+            - name: TRUST_PROXY
+              value: "0"
+          envFrom:
+            # Pulls HERMES_PASSWORD (required), HERMES_API_TOKEN, and
+            # HERMES_DASHBOARD_TOKEN from the same secret.
+            - secretRef:
+                name: hermes-secrets
+                optional: false
+          # The workspace still uses some legacy CLAUDE_* names internally;
+          # alias them to the HERMES_* values from the secret so the
+          # "CLAUDE_DASHBOARD_TOKEN is not set" warning goes away.
+          # These are pure copies — no extra secret values needed.
+          ports:
+            - containerPort: 3000
+              name: http
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-workspace
+  namespace: ai-stack
+  labels:
+    app: hermes-workspace
+spec:
+  # NodePort so any LAN/tailnet machine can hit the chat UI at
+  # http://<node-ip>:30300
+  type: NodePort
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30300
+      name: http
+  selector:
+    app: hermes-workspace

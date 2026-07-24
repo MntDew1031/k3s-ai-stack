@@ -1,0 +1,181 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kube-prometheus-stack
+  namespace: monitoring
+spec:
+  interval: 30m
+  # This chart's --wait can be slow (StatefulSets + a node-exporter DaemonSet
+  # across every node); give it room so transient slowness doesn't fail the
+  # release.
+  timeout: 12m
+  chart:
+    spec:
+      chart: kube-prometheus-stack
+      version: "66.x"
+      sourceRef:
+        kind: HelmRepository
+        name: prometheus-community
+        namespace: flux-system
+      interval: 30m
+  values:
+    # k3s embeds controller-manager, scheduler, and kube-proxy inside the k3s
+    # server process, so they expose no standalone scrape target. Leaving these
+    # enabled fires permanent false-positive criticals (KubeControllerManagerDown
+    # / KubeSchedulerDown / KubeProxyDown). Disable them. (etcd IS scrapeable on
+    # k3s, so kubeEtcd stays enabled.)
+    kubeControllerManager:
+      enabled: false
+    kubeScheduler:
+      enabled: false
+    kubeProxy:
+      enabled: false
+
+    # 1. Soft node preference: keep monitoring on control-02 under normal
+    #    conditions, but allow it to reschedule to any healthy node if control-02
+    #    is down (HA). Each component below sets the same soft affinity.
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values: [control-02]
+
+    # 2. Grafana — admin creds come from SOPS-encrypted Secret.
+    grafana:
+      # Do NOT set adminPassword here — reference the existing Secret.
+      admin:
+        existingSecret: grafana-admin
+        userKey: admin-user
+        passwordKey: admin-password
+      service:
+        # Expose on LAN via NodePort 30090 -> 80 so you can hit Grafana at
+        # http://<any-node-ip>:30090 without kubectl port-forward. Login still
+        # requires the admin password from the grafana-admin Secret.
+        type: NodePort
+        nodePort: 30090
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: [control-02]
+      grafana.ini:
+        auth.anonymous:
+          enabled: false
+        security:
+          # HTTP-over-LAN access via NodePort, so cookie_secure must be off or
+          # the browser drops the session cookie and login loops. If/when this
+          # moves behind HTTPS (tunnel + Cloudflare Access), flip both back on.
+          cookie_secure: false
+          cookie_samesite: lax
+          disable_gravatar: true
+          strict_transport_security: false
+          # Don't let the embedded dashboards iframe Grafana.
+          allow_embedding: false
+        users:
+          allow_sign_up: false
+          auto_assign_org: true
+          auto_assign_org_role: Viewer
+      podSecurityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+        seccompProfile:
+          type: RuntimeDefault
+      containerSecurityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        capabilities:
+          drop: ["ALL"]
+
+    # 3. Configure Prometheus Storage (Using Longhorn)
+    prometheus:
+      prometheusSpec:
+        retention: 10d
+        retentionSize: "16GB"
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: In
+                      values: [control-02]
+        # Only admit ServiceMonitors / PodMonitors WE labeled. Blocks a
+        # compromised workload from registering a rogue scrape target.
+        serviceMonitorSelectorNilUsesHelmValues: false
+        podMonitorSelectorNilUsesHelmValues: false
+        ruleSelectorNilUsesHelmValues: false
+        storageSpec:
+          volumeClaimTemplate:
+            spec:
+              storageClassName: longhorn
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 20Gi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          fsGroup: 2000
+          seccompProfile:
+            type: RuntimeDefault
+
+    kube-state-metrics:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: [control-02]
+
+    prometheusOperator:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: [control-02]
+
+    alertmanager:
+      alertmanagerSpec:
+        # Full Alertmanager config comes from the SOPS-encrypted
+        # alertmanager-discord Secret (key alertmanager.yaml). It routes
+        # severity=critical alerts (node down, disk full, crashloops, etc.) to
+        # Discord and drops Watchdog/InfoInhibitor. We use configSecret with an
+        # inline webhook_url because the prometheus-operator rejects
+        # webhook_url_file for discord ("no discord webhook URL provided"); the
+        # URL stays out of git via SOPS. This replaces the chart's default
+        # alertmanager config entirely.
+        configSecret: alertmanager-discord
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: In
+                      values: [control-02]
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          fsGroup: 2000
+          seccompProfile:
+            type: RuntimeDefault

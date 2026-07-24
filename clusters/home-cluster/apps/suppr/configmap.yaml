@@ -1,0 +1,41 @@
+# Non-secret runtime config. Secrets live in suppr-secrets.yaml (SOPS).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: suppr-config
+  namespace: suppr
+data:
+  ENVIRONMENT: "production"
+  JWT_ALGORITHM: "HS256"
+  ACCESS_TOKEN_EXPIRE_MINUTES: "43200"
+  # Local admin dashboard uses separate password+TOTP Bearer sessions.
+  ADMIN_SESSION_EXPIRE_MINUTES: "15"
+  SPOONACULAR_BASE_URL: "https://api.example.invalid"
+
+  # HTTPS origins only (prod config rejects http://). Capacitor WebView origins
+  # let the bundled iOS app hit the API. TLS is terminated at Cloudflare's edge;
+  # cloudflared reaches the api Service over plain HTTP in-cluster.
+  CORS_ORIGINS: "https://app.example.com,https://www.app.example.com,capacitor://localhost,https://localhost"
+
+  POSTGRES_USER: "suppr"
+  POSTGRES_DB: "suppr"
+
+  REDIS_URL: "redis://redis.suppr.svc.cluster.local:6379/0"
+
+  # Password reset emails: link base + from address. RESEND_API_KEY lives in
+  # the secret; without it the API logs reset links instead of sending.
+  # Sign in with Apple / Google. Apple needs only the bundle id (audience
+  # check); GOOGLE_CLIENT_IDS stays empty until a Google Cloud OAuth iOS
+  # client exists — empty disables Google sign-in server-side.
+  APPLE_BUNDLE_ID: "com.example.suppr"
+  GOOGLE_CLIENT_IDS: ""
+
+  # APNs push (vote nudge). Key id/team id/.p8 content live in
+  # suppr-secrets (APNS_KEY_ID, APNS_TEAM_ID, APNS_KEY_P8) — push is
+  # disabled until those exist. Flip APNS_USE_SANDBOX to "true" only
+  # when testing against tokens from Xcode dev builds.
+  APNS_TOPIC: "com.example.suppr"
+  APNS_USE_SANDBOX: "false"
+
+  FRONTEND_URL: "https://app.example.com"
+  EMAIL_FROM: "Suppr <no-reply@app.example.com>"

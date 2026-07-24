@@ -1,0 +1,54 @@
+# The morning dinner-vote nudge (Suppr's core loop). Runs the api image's
+# `app.jobs.nudge` module HOURLY: each user picks their morning hour
+# (nudge_hour preference, default 9am Arizona) and the job pushes "What's for
+# dinner?" to devices whose hour is now, for households that haven't
+# started/decided today's vote. Expiry reminders ride the same per-user hour.
+# The expired-session sweep runs every invocation (stale votes close within
+# the hour). Fast no-op most hours.
+#
+# Inert until the APNs secrets exist (APNS_KEY_ID / APNS_TEAM_ID / APNS_KEY_P8
+# in suppr-secrets) — the job logs "APNs not configured" and exits 0.
+# NB: bump this image tag together with api.yaml on each release.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nudge
+  namespace: suppr
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: nudge   # netpol: egress to postgres + APNs (443)
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: regcred
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: nudge
+              image: example.invalid/private/backend:REDACTED
+              command: ["python", "-m", "app.jobs.nudge"]
+              envFrom:
+                - configMapRef: { name: suppr-config }
+                - secretRef: { name: suppr-secrets }
+              resources:
+                requests: { cpu: "50m", memory: "128Mi" }
+                limits: { cpu: "500m", memory: "512Mi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]

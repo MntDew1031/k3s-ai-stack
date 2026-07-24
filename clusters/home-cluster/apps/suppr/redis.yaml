@@ -1,0 +1,51 @@
+# Redis 7 — ClusterIP Service + Deployment (cache only, no persistence).
+#
+# Ephemeral: used for caching/rate-limit counters, safe to lose on restart, so
+# no PVC. Hardened (non-root 999, read-only rootfs, all caps dropped).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: suppr
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: suppr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999      # redis uid in the official alpine image
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: example.invalid/third-party/cache:PINNED_VERSION
+          ports:
+            - containerPort: 6379
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
